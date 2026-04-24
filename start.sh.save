@@ -1,0 +1,68 @@
+#!/bin/bash
+# 项目根目录（自动获取当前脚本所在目录）
+PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
+BACKEND_DIR="$PROJECT_ROOT/backend"
+FRONTEND_DIR="$PROJECT_ROOT/frontend"
+
+# 日志文件
+BACKEND_LOG="$PROJECT_ROOT/backend.log"
+FRONTEND_LOG="$PROJECT_ROOT/frontend.log"
+
+# PID 文件（用于记录进程号，方便停止）
+BACKEND_PID="$PROJECT_ROOT/backend.pid"
+FRONTEND_PID="$PROJECT_ROOT/frontend.pid"
+
+# 颜色输出
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+NC='\033[0m' # No Color
+
+# 1. 启动 MySQL（如果尚未启动）
+echo "正在检查 MySQL 服务..."
+if sudo service mysql status | grep -q "active (running)"; then
+    echo -e "${GREEN}MySQL 已在运行${NC}"
+cat start.shcat start.shcat start.shcat start.shelse
+    echo "启动 MySQL..."
+    sudo service mysql start
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}MySQL 启动成功${NC}"
+    else
+        echo -e "${RED}MySQL 启动失败，请检查配置${NC}"
+        exit 1
+    fi
+fi
+
+# 2. 启动后端
+echo "正在启动后端..."
+cd "$BACKEND_DIR"
+# 检查虚拟环境是否存在
+if [ ! -d "venv" ]; then
+    echo -e "${RED}虚拟环境不存在，请先运行: cd backend && python3.9 -m venv venv && source venv/bin/activate && pip install -r requirements.txt${NC}"
+    exit 1
+fi
+# 激活虚拟环境并后台运行
+source venv/bin/activate
+nohup python app_main.py > "$BACKEND_LOG" 2>&1 &
+echo $! > "$BACKEND_PID"
+deactivate
+cd "$PROJECT_ROOT"
+echo -e "${GREEN}后端已启动，PID $(cat $BACKEND_PID)${NC}"
+
+# 3. 启动前端
+echo "正在启动前端..."
+cd "$FRONTEND_DIR"
+# 检查 node_modules 是否存在（可选）
+if [ ! -d "node_modules" ]; then
+    echo "正在安装前端依赖（首次运行较慢）..."
+    npm install
+fi
+nohup npm run dev > "$FRONTEND_LOG" 2>&1 &
+echo $! > "$FRONTEND_PID"
+cd "$PROJECT_ROOT"
+echo -e "${GREEN}前端已启动，PID $(cat $FRONTEND_PID)${NC}"
+
+echo ""
+echo -e "${GREEN}全部服务已启动！${NC}"
+echo "后端日志: $BACKEND_LOG"
+echo "前端日志: $FRONTEND_LOG"
+echo "访问前端: http://localhost:5173"

@@ -694,6 +694,7 @@ const importStudentsFromFile = async () => {
       showFileImportDialog.value = false
       selectedFile.value = null
       await fetchExamStudents()
+      emit('refresh')   // 新增
     } else {
       ElMessage.error(response.data.msg || '文件导入失败')
     }

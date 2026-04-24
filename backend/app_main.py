@@ -5,6 +5,7 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
 import os
@@ -29,6 +30,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 挂载静态文件
+# 把本地 uploads 文件夹挂载到 http://xxx:8001/uploads/
+os.makedirs("uploads", exist_ok=True)  # 自动创建目录，防止报错
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 # 注册路由
 app.include_router(auth.router, tags=["认证"])

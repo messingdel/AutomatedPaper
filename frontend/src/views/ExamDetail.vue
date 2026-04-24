@@ -86,9 +86,9 @@
             <div class="tab-content">
               <AIGradingConsole 
                 :exam-id="examId" 
-                :scores="scores"
+                :scores="gradingStats"
                 :total-students="examStudents.length"
-                @refresh="fetchScores"
+                @refresh="fetchGradingStas"
               />
             </div>
           </el-tab-pane>
@@ -98,7 +98,7 @@
           <el-tab-pane label="成绩管理" name="scores">
             <div class="tab-content">
               <ScoreManager 
-                :scores="scores" 
+                :scores="scoreList"
                 :exam-id="examId" 
                 @refresh="fetchScores"
               />
@@ -160,7 +160,11 @@ const exam = ref(null)
 const activeTab = ref('students')
 const examStudents = ref([])
 const questions = ref([])
-// const scores = ref([])
+// 阅卷进度统计（对象）
+const gradingStats = ref({ total: 0, graded: 0 })
+
+// 成绩列表（数组）
+const scoreList = ref([])
 
 const showAddStudentDialog = ref(false)
 const selectedStudentId = ref('')
@@ -198,8 +202,17 @@ const handleStudentsUpdate = (students) => {
   examStudents.value = students
 }
 
-
-
+// 获取阅卷进度统计
+const fetchGradingStats = async () => {
+  try {
+    const res = await axios.get(`/api/exams/${examId}/grading-progress`)
+    if (res.data.code === 1) {
+      gradingStats.value = res.data.data
+    }
+  } catch (error) {
+    console.error('获取阅卷统计失败', error)
+  }
+}
 
 
 // 处理题目更新
@@ -208,17 +221,20 @@ const handleQuestionsUpdate = (newQuestions) => {
 }
 
 
-
 // 获取成绩列表
-// const fetchScores = async () => {
-//   try {
-//     const response = await axios.get(`http://localhost:8001/api/exams/${examId}/scores`)
-//     scores.value = response.data.data || []
-//   } catch (error) {
-//     console.error('获取成绩列表失败:', error)
-//   }
-// }
-
+const fetchScores = async () => {
+  try {
+    const response = await axios.get(`http://localhost:8001/api/exams/${examId}/scores`)
+    if (response.data.code === 1) {
+      scoreList.value = response.data.data.students || []
+    } else {
+      scoreList.value = []
+    }
+  } catch (error) {
+    console.error('获取成绩列表失败:', error)
+    scoreList.value = []
+  }
+}
 
 
 
@@ -343,10 +359,11 @@ const exportScores = () => {
   ElMessage.info('成绩导出功能开发中...')
 }
 
-
-onMounted(async () => {
-  await fetchExam()
-  // fetchScores()
+// 在 onMounted 中调用
+onMounted(() => {
+  fetchExam()
+  fetchGradingStats()   // 更新 gradingStats
+  fetchScores()         // 更新 scoreList
 })
 </script>
 

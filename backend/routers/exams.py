@@ -6,7 +6,9 @@ import logging
 import os
 import shutil
 import time
-
+from pydantic import BaseModel, field_validator
+from datetime import datetime
+from typing import Optional
 from backend.database import engine
 
 
@@ -24,6 +26,15 @@ class ExamRequest(BaseModel):
     total_questions: Optional[int] = None
     total_score: Optional[int] = None
 
+    @field_validator('exam_date', mode='before')
+    @classmethod
+    def empty_str_to_none(cls, v):
+        """将空字符串转换为 None"""
+        if v == "":
+            return None
+        return v
+
+
 class ExamUpdate(BaseModel):
     exam_name: Optional[str] = None
     description: Optional[str] = None
@@ -31,6 +42,14 @@ class ExamUpdate(BaseModel):
     total_questions: Optional[int] = None
     total_score: Optional[int] = None
     status: Optional[str] = None
+
+    @field_validator('exam_date', mode='before')
+    @classmethod
+    def empty_str_to_none(cls, v):
+        if v == "":
+            return None
+        return v
+
 
 # ==================== 考试管理API ====================
 

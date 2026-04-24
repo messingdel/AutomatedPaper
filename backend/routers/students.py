@@ -296,7 +296,7 @@ def get_exam_students(exam_id: int):
                     'student_id': row.student_id,
                     'name': row.name,
                     'student_number': row.student_number,
-                    'class_name': row.class_name,
+                    'class': row.class_name,
                     'contact_info': row.contact_info,
                     'created_at': row.created_at.isoformat() if row.created_at else None,
                     'updated_at': row.updated_at.isoformat() if row.updated_at else None,
