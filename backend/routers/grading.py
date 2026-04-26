@@ -123,12 +123,9 @@ def ocr_only(image_paths: List[str], questions: List[dict]) -> Dict[int, dict]:
     # 修改提示词，强调不要输出题号
     prompt = (
         "你是一个严格的光学字符识别（OCR）工具。\n"
-        "请分析图片中的学生答题卡。注意：请务必从第一道小题开始识别，不要跳过任何题号。\n"
-        "即使题目靠近表格或印刷体标题，也要尝试提取学生手写答案。\n"
         "请分析图片中的学生答题卡，忽略所有印刷体题目描述、表格、得分栏等无关内容。\n"
         f"请按顺序识别每个小题的学生答案。一共有 {num_questions} 道小题。\n"
         "小题的题号是普通数字加标点，例如“1.”、“2.”、“3.”。每个这样的题号代表一道独立的小题。\n"
-        "同一道小题的答案内部可能包含分点，分点符号通常是带圈数字“①”、“②”、“③”或括号数字“(1)”、“(2)”。这些分点属于同一道小题，必须合并为一个答案字符串，使用换行符分隔各个分点。\n"
         "注意：填空题的答案通常很短，可能是单个数字、字母或词语，请务必提取，不要忽略。\n"
         "重要：你需要准确识别学生手写答案中的数学符号和公式，包括但不限于：\n"
         "  - 绝对值：|x|、||x||、|a-b| 等，用竖线表示，不要写成 abs(x) 或 abs()\n"
@@ -146,7 +143,6 @@ def ocr_only(image_paths: List[str], questions: List[dict]) -> Dict[int, dict]:
         "重要：输出的答案中不要包含题号本身（例如不要输出“2、负实轴单位圆”，只需要输出“负实轴单位圆”）。\n"
         "如果某道小题没有答案或无法识别，则对应位置输出空字符串。\n"
         "严禁将多个小题的答案合并到一个数组元素中！\n"
-        "严禁将一道小题的多个分点拆分成多个数组元素！\n"
         "不要输出任何其他解释或标记。"
     )
 
@@ -221,19 +217,13 @@ def ocr_only(image_paths: List[str], questions: List[dict]) -> Dict[int, dict]:
             if re.match(pat, text.strip()):
                 logger.warning(f"检测到占位符文本，清空: {text}")
                 return ""
-        # 移除题号前缀（支持：数字加点、数字加顿号、带圈数字、括号数字）
-        pattern = r'(?:^|\n)\s*(?:[①②③④⑤⑥⑦⑧⑨⑩]|\(\d+\)|\d+[\.、])\s*'
+        # 移除题号前缀（支持：数字加点/顿号、带圈数字、括号数字）
+        # 修改点：数字加点/顿号后面必须跟空格或行尾，避免误删 "2.5" 中的点
+        pattern = r'(?:^|\n)\s*(?:[①②③④⑤⑥⑦⑧⑨⑩]|\(\d+\)|\d+[\.、](?:\s|$))'
         text = re.sub(pattern, '\n', text)
+        # 合并连续换行符，去除首尾空白
         text = re.sub(r'\n+', '\n', text).strip()
         return text
-
-    cleaned_data = [clean_answer(ans) for ans in data]
-
-    result = {}
-    for i, q in enumerate(questions):
-        order = q['question_order']
-        result[order] = {"exists": True, "answer": cleaned_data[i] if i < len(cleaned_data) else ""}
-    return result
 
 
 # ==================== 第二次识别：纠错模型 ====================
@@ -321,11 +311,11 @@ def score_only(question: dict, student_answer: str) -> float:
     reference = question.get('reference_answer', '')
 
     if q_type in ['选择题', '填空题', '判断题']:
-        # ========== 修改点：保留数学符号（包括竖线） ==========
+        # ========== 修改点：保留希腊字母和其他数学符号 ==========
         def normalize(s):
             s = s.strip().lower()
-            # 保留字母、数字、汉字、常用数学符号、竖线（绝对值）、方括号等
-            s = re.sub(r'[^\w\u4e00-\u9fff\+\-\*/=<>≤≥≠√∑∫∂\|\[\]]', '', s)
+            # 保留字母、数字、汉字、希腊字母(\u0370-\u03ff)、常用数学符号、竖线、方括号等
+            s = re.sub(r'[^\w\u4e00-\u9fff\u0370-\u03ff\+\-\*/=<>≤≥≠√∑∫∂\|\[\]]', '', s)
             return s
         std_ref = normalize(reference)
         std_ans = normalize(student_answer)
@@ -380,6 +370,50 @@ def score_only(question: dict, student_answer: str) -> float:
         logger.error(f"评分调用失败: {e}")
         return 0.0
 
+# ==================== 辅助处理函数 ====================
+def merge_subjective_answers(questions: List[dict], answers: Dict[int, str]) -> Dict[int, str]:
+    """
+    根据 parent_id 合并主观题的分点答案。
+    规则：
+    - 客观题（选择题、填空题、判断题）不合并，保持独立（忽略 parent_id）。
+    - 主观题中，parent_id 为 NULL 的独立处理；非 NULL 的按相同 parent_id 合并。
+    返回：{ question_order: merged_answer }，其中非第一个分点的答案会被置空字符串。
+    """
+    # 分组
+    groups = {}  # key: group_id (parent_id 或 question_order), value: list of question_order
+    for q in questions:
+        order = q['question_order']
+        q_type = q.get('type', '主观题')
+        # 客观题独立分组（以自身 order 为组）
+        if q_type in ['选择题', '填空题', '判断题']:
+            groups[order] = [order]
+            continue
+
+        # 主观题
+        pid = q.get('parent_id')
+        if pid is None:
+            groups[order] = [order]
+        else:
+            groups.setdefault(pid, []).append(order)
+
+    merged = {}
+    for group_orders in groups.values():
+        # 收集答案
+        ans_texts = [answers.get(o, "") for o in group_orders]
+        # 合并非空答案（用换行分隔）
+        combined = "\n".join([t for t in ans_texts if t.strip()])
+        # 第一个题目存储合并后的答案
+        first = group_orders[0]
+        merged[first] = combined
+        # 其余题目答案置空
+        for other in group_orders[1:]:
+            merged[other] = ""
+
+        # 日志：如果合并了多个题目，记录信息
+        if len(group_orders) > 1:
+            logger.info(f"合并主观题组 {group_orders}: 原答案片段 -> 合并后长度 {len(combined)}")
+
+    return merged
 
 # ==================== 后台阅卷任务 ====================
 async def process_grading(exam_id: int, job_id: int):
@@ -418,7 +452,8 @@ async def process_grading(exam_id: int, job_id: int):
 
             questions_result = conn.execute(
                 text("""
-                     SELECT q.id, q.type, q.content, q.reference_answer, q.scoring_rules, q.score as max_score, eq.question_order
+                     SELECT q.id, q.type, q.content, q.reference_answer, q.scoring_rules,
+                            q.score as max_score, eq.question_order, q.parent_id
                      FROM questions q
                      INNER JOIN exam_questions eq ON q.id = eq.question_id
                      WHERE eq.exam_id = :exam_id
@@ -475,16 +510,22 @@ async def process_grading(exam_id: int, job_id: int):
                 ocr_result = ocr_only(original_paths, questions)
                 original_answers = {order: info["answer"] for order, info in ocr_result.items()}
 
-            need_correct = any(len(ans) < 2 for ans in original_answers.values())
+            # ========== 修改点：纠错触发条件优化 ==========
+            need_correct = any(not ans.strip() for ans in original_answers.values())
             if need_correct:
-                logger.info("检测到可能错误的答案，启动纠错模型...")
+                logger.info("检测到空白答案，启动纠错模型...")
                 corrected_answers = correct_answers_with_image(original_paths, original_answers, questions)
                 for order, new_ans in corrected_answers.items():
                     if new_ans:
                         ocr_result[order]["answer"] = new_ans
                         logger.info(f"纠正题目 {order}: {original_answers[order]} -> {new_ans}")
             else:
-                logger.info("OCR结果可信，跳过纠错步骤")
+                logger.info("OCR结果无空白答案，跳过纠错步骤")
+
+            # ========== 合并主观题分点答案 ==========
+            merged_answers = merge_subjective_answers(questions, {order: info["answer"] for order, info in ocr_result.items()})
+            for order, new_ans in merged_answers.items():
+                ocr_result[order]["answer"] = new_ans
 
             for proc_path in processed_paths:
                 if "_processed" in proc_path and os.path.exists(proc_path):
