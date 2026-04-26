@@ -372,46 +372,41 @@ def score_only(question: dict, student_answer: str) -> float:
 
 # ==================== 辅助处理函数 ====================
 def merge_subjective_answers(questions: List[dict], answers: Dict[int, str]) -> Dict[int, str]:
-    """
-    根据 parent_id 合并主观题的分点答案。
-    规则：
-    - 客观题（选择题、填空题、判断题）不合并，保持独立（忽略 parent_id）。
-    - 主观题中，parent_id 为 NULL 的独立处理；非 NULL 的按相同 parent_id 合并。
-    返回：{ question_order: merged_answer }，其中非第一个分点的答案会被置空字符串。
-    """
-    # 分组
-    groups = {}  # key: group_id (parent_id 或 question_order), value: list of question_order
-    for q in questions:
-        order = q['question_order']
-        q_type = q.get('type', '主观题')
-        # 客观题独立分组（以自身 order 为组）
-        if q_type in ['选择题', '填空题', '判断题']:
-            groups[order] = [order]
-            continue
-
-        # 主观题
-        pid = q.get('parent_id')
-        if pid is None:
-            groups[order] = [order]
-        else:
-            groups.setdefault(pid, []).append(order)
+    if not questions:
+        return answers.copy()
 
     merged = {}
-    for group_orders in groups.values():
-        # 收集答案
-        ans_texts = [answers.get(o, "") for o in group_orders]
-        # 合并非空答案（用换行分隔）
-        combined = "\n".join([t for t in ans_texts if t.strip()])
-        # 第一个题目存储合并后的答案
-        first = group_orders[0]
-        merged[first] = combined
-        # 其余题目答案置空
-        for other in group_orders[1:]:
-            merged[other] = ""
+    i = 0
+    n = len(questions)
+    while i < n:
+        q = questions[i]
+        order = q['question_order']
+        q_type = q.get('type', '主观题')
 
-        # 日志：如果合并了多个题目，记录信息
-        if len(group_orders) > 1:
-            logger.info(f"合并主观题组 {group_orders}: 原答案片段 -> 合并后长度 {len(combined)}")
+        # 独立题型：选择题、判断题、填空题
+        if q_type in ['选择题', '判断题', '填空题']:
+            merged[order] = answers.get(order, "")
+            i += 1
+            continue
+
+        # 其他主观题：连续块合并
+        block_orders = []
+        j = i
+        while j < n and questions[j].get('type', '主观题') not in ['选择题', '判断题', '填空题']:
+            block_orders.append(questions[j]['question_order'])
+            j += 1
+
+        if block_orders:
+            ans_texts = [answers.get(o, "") for o in block_orders]
+            combined = "\n".join([t for t in ans_texts if t.strip()])
+            first = block_orders[0]
+            merged[first] = combined
+            for other in block_orders[1:]:
+                merged[other] = ""
+            if len(block_orders) > 1:
+                logger.info(f"合并主观题块 {block_orders}")
+
+        i = j
 
     return merged
 
