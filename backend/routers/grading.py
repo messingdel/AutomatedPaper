@@ -39,11 +39,11 @@ class StartGradingResponse(BaseModel):
     data: dict
 
 
-# ==================== 图像预处理函数 ====================
+# ==================== 温和的图像预处理函数 ====================
 def preprocess_image(image_path: str) -> str:
     """
-    对答题卡图片进行预处理，返回处理后的图片路径。
-    处理步骤：灰度化 -> 二值化（Otsu） -> 去噪（中值滤波） -> 倾斜校正（可选）
+    对答题卡图片进行温和预处理：灰度化 + CLAHE增强 + 轻量去噪 + 可选透视校正。
+    不进行二值化和形态学操作，保留图像细节，适合多模态模型直接识别。
     生成临时文件，原始文件不变。
     """
     img = cv2.imread(image_path)
@@ -51,22 +51,59 @@ def preprocess_image(image_path: str) -> str:
         logger.warning(f"无法读取图片: {image_path}")
         return image_path
 
+    # 1. 灰度化
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    denoised = cv2.medianBlur(binary, 3)
 
-    # 倾斜校正
-    coords = np.column_stack(np.where(denoised > 0))
-    if len(coords) > 0:
-        angle = cv2.minAreaRect(coords)[-1]
-        if angle < -45:
-            angle = 90 + angle
-        if abs(angle) > 0.5:
-            (h, w) = denoised.shape[:2]
-            center = (w // 2, h // 2)
-            M = cv2.getRotationMatrix2D(center, angle, 1.0)
-            denoised = cv2.warpAffine(denoised, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    # 2. CLAHE 增强对比度
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    enhanced = clahe.apply(gray)
 
+    # 3. 轻量去噪（双边滤波保留边缘）
+    denoised = cv2.bilateralFilter(enhanced, 9, 75, 75)
+
+    # 4. 可选：透视校正（默认关闭，可通过参数开启）
+    def apply_perspective_correction(img, enable=False):
+        if not enable:
+            return img
+        try:
+            _, binary = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                max_contour = max(contours, key=cv2.contourArea)
+                epsilon = 0.02 * cv2.arcLength(max_contour, True)
+                approx = cv2.approxPolyDP(max_contour, epsilon, True)
+                if len(approx) == 4:
+                    pts = approx.reshape(4, 2)
+                    # 排序四个角点（左上、右上、右下、左下）
+                    rect = np.zeros((4, 2), dtype=np.float32)
+                    s = pts.sum(axis=1)
+                    rect[0] = pts[np.argmin(s)]
+                    rect[2] = pts[np.argmax(s)]
+                    diff = np.diff(pts, axis=1)
+                    rect[1] = pts[np.argmin(diff)]
+                    rect[3] = pts[np.argmax(diff)]
+                    # 计算目标尺寸
+                    w1 = np.linalg.norm(rect[1] - rect[0])
+                    w2 = np.linalg.norm(rect[2] - rect[3])
+                    h1 = np.linalg.norm(rect[3] - rect[0])
+                    h2 = np.linalg.norm(rect[2] - rect[1])
+                    dst_w = int(max(w1, w2))
+                    dst_h = int(max(h1, h2))
+                    dst = np.array([[0, 0], [dst_w - 1, 0], [dst_w - 1, dst_h - 1], [0, dst_h - 1]], dtype=np.float32)
+                    M = cv2.getPerspectiveTransform(rect, dst)
+                    img = cv2.warpPerspective(img, M, (dst_w, dst_h))
+        except Exception as e:
+            logger.warning(f"透视校正失败: {e}")
+        return img
+
+    # 调用透视校正（此处 enable=False 关闭）
+    denoised = apply_perspective_correction(denoised, enable=False)
+
+    # 增加边缘填充（防止顶部信息丢失）
+    border_size = 20
+    denoised = cv2.copyMakeBorder(denoised, border_size, border_size, border_size, border_size, cv2.BORDER_CONSTANT,
+                                  value=255)
+    # 保存临时文件（灰度图，非二值）
     base, ext = os.path.splitext(image_path)
     processed_path = f"{base}_processed{ext}"
     cv2.imwrite(processed_path, denoised)
@@ -83,14 +120,30 @@ def ocr_only(image_paths: List[str], questions: List[dict]) -> Dict[int, dict]:
         return {}
 
     num_questions = len(questions)
+    # 修改提示词，强调不要输出题号
     prompt = (
         "你是一个严格的光学字符识别（OCR）工具。\n"
+        "请分析图片中的学生答题卡。注意：请务必从第一道小题开始识别，不要跳过任何题号。\n"
+        "即使题目靠近表格或印刷体标题，也要尝试提取学生手写答案。\n"
         "请分析图片中的学生答题卡，忽略所有印刷体题目描述、表格、得分栏等无关内容。\n"
         f"请按顺序识别每个小题的学生答案。一共有 {num_questions} 道小题。\n"
         "小题的题号是普通数字加标点，例如“1.”、“2.”、“3.”。每个这样的题号代表一道独立的小题。\n"
         "同一道小题的答案内部可能包含分点，分点符号通常是带圈数字“①”、“②”、“③”或括号数字“(1)”、“(2)”。这些分点属于同一道小题，必须合并为一个答案字符串，使用换行符分隔各个分点。\n"
-        "重要：你需要准确识别学生手写答案中的数学符号和公式，包括但不限于：运算符号（+、-、×、÷、=、≈、≠、≤、≥、±、√等）、希腊字母、上下标（用^和_表示）、分数（用/表示）等。\n"
+        "注意：填空题的答案通常很短，可能是单个数字、字母或词语，请务必提取，不要忽略。\n"
+        "重要：你需要准确识别学生手写答案中的数学符号和公式，包括但不限于：\n"
+        "  - 绝对值：|x|、||x||、|a-b| 等，用竖线表示，不要写成 abs(x) 或 abs()\n"
+        "  - 范数：||x||、||x||_p\n"
+        "  - 基本运算：+、-、×、÷、=、≈、≠、≤、≥、±、√、∛、∞\n"
+        "  - 希腊字母：α、β、γ、δ、ε、λ、μ、π、σ、τ、ω\n"
+        "  - 上下标：x^2、y_n、a^{b}、e^{x}（用 ^ 和 _ 表示）\n"
+        "  - 分数：a/b 或水平分数线（写作 (分子)/(分母)）\n"
+        "  - 积分：∫、∬、∮\n"
+        "  - 求和连乘：∑、∏\n"
+        "  - 集合符号：∈、∉、⊂、⊆、∪、∩、∅\n"
+        "  - 逻辑符号：⇒、⇔、∀、∃\n"
+        "  - 矩阵：用方括号表示，如 [a b; c d]\n"
         "输出一个JSON数组，按题号顺序（1,2,3...）包含每个小题的学生答案。\n"
+        "重要：输出的答案中不要包含题号本身（例如不要输出“2、负实轴单位圆”，只需要输出“负实轴单位圆”）。\n"
         "如果某道小题没有答案或无法识别，则对应位置输出空字符串。\n"
         "严禁将多个小题的答案合并到一个数组元素中！\n"
         "严禁将一道小题的多个分点拆分成多个数组元素！\n"
@@ -155,7 +208,7 @@ def ocr_only(image_paths: List[str], questions: List[dict]) -> Dict[int, dict]:
         data.append("")
     data = data[:num_questions]
 
-    # 后处理清洗函数（数学友好版）
+    # ========== 修改点：增强清洗函数，移除题号前缀（包括数字加顿号） ==========
     def clean_answer(text: str) -> str:
         if not text:
             return ""
@@ -168,8 +221,9 @@ def ocr_only(image_paths: List[str], questions: List[dict]) -> Dict[int, dict]:
             if re.match(pat, text.strip()):
                 logger.warning(f"检测到占位符文本，清空: {text}")
                 return ""
-        # 仅移除行首的题号标记，不影响答案内部的数字和符号
-        text = re.sub(r'(?:^|\n)\s*(?:[①②③④⑤⑥⑦⑧⑨⑩]|\(\d+\)|\d+\.)\s*', '\n', text)
+        # 移除题号前缀（支持：数字加点、数字加顿号、带圈数字、括号数字）
+        pattern = r'(?:^|\n)\s*(?:[①②③④⑤⑥⑦⑧⑨⑩]|\(\d+\)|\d+[\.、])\s*'
+        text = re.sub(pattern, '\n', text)
         text = re.sub(r'\n+', '\n', text).strip()
         return text
 
@@ -182,20 +236,19 @@ def ocr_only(image_paths: List[str], questions: List[dict]) -> Dict[int, dict]:
     return result
 
 
-# ==================== 第二次识别：纠错模型（基于图片对OCR结果进行修正） ====================
+# ==================== 第二次识别：纠错模型 ====================
 def correct_answers_with_image(image_paths: List[str], original_answers: Dict[int, str], questions: List[dict]) -> Dict[int, str]:
     """使用多模态模型对OCR答案进行纠错，返回纠正后的答案字典"""
     if not image_paths:
         return {}
 
     num_questions = len(questions)
-    # 构建原始答案的描述
     answers_text = "\n".join([f"第{q['question_order']}题: {original_answers.get(q['question_order'], '')}" for q in questions])
     prompt = (
         f"以下是OCR工具从答题卡图片中识别出的学生答案，可能包含错误。请根据图片中实际的学生手写内容，纠正这些答案。\n"
         f"原始识别结果：\n{answers_text}\n"
         "请按题号顺序输出纠正后的答案，格式为JSON数组，例如：[\"纠正后的答案1\", \"纠正后的答案2\", ...]。\n"
-        "如果原始答案正确，则保持不变；如果无法识别，输出空字符串。注意保留数学符号和公式。不要输出其他内容。"
+        "如果原始答案正确，则保持不变；如果无法识别，输出空字符串。注意保留数学符号和公式（包括绝对值竖线）。不要输出其他内容。"
     )
 
     content = [{"text": prompt}]
@@ -268,10 +321,11 @@ def score_only(question: dict, student_answer: str) -> float:
     reference = question.get('reference_answer', '')
 
     if q_type in ['选择题', '填空题', '判断题']:
+        # ========== 修改点：保留数学符号（包括竖线） ==========
         def normalize(s):
             s = s.strip().lower()
-            # 保留数学符号
-            s = re.sub(r'[^\w\u4e00-\u9fff\+\-\*/=<>≤≥≠√∑∫∂]', '', s)
+            # 保留字母、数字、汉字、常用数学符号、竖线（绝对值）、方括号等
+            s = re.sub(r'[^\w\u4e00-\u9fff\+\-\*/=<>≤≥≠√∑∫∂\|\[\]]', '', s)
             return s
         std_ref = normalize(reference)
         std_ans = normalize(student_answer)
@@ -411,19 +465,20 @@ async def process_grading(exam_id: int, job_id: int):
                 continue
 
             original_paths = [row.file_path for row in images]
-            # 预处理图片
             processed_paths = [preprocess_image(p) for p in original_paths]
 
-            # 第一次识别：OCR
             ocr_result = ocr_only(processed_paths, questions)
             original_answers = {order: info["answer"] for order, info in ocr_result.items()}
 
-            # 第二次识别：纠错（仅当存在空答案或明显错误时触发，此处简单判断有任一空或长度小于2）
+            if all(len(ans) == 0 for ans in original_answers.values()):
+                logger.warning("预处理后OCR结果为空，尝试使用原始图片重新识别...")
+                ocr_result = ocr_only(original_paths, questions)
+                original_answers = {order: info["answer"] for order, info in ocr_result.items()}
+
             need_correct = any(len(ans) < 2 for ans in original_answers.values())
             if need_correct:
                 logger.info("检测到可能错误的答案，启动纠错模型...")
-                corrected_answers = correct_answers_with_image(processed_paths, original_answers, questions)
-                # 合并纠正后的答案（非空覆盖）
+                corrected_answers = correct_answers_with_image(original_paths, original_answers, questions)
                 for order, new_ans in corrected_answers.items():
                     if new_ans:
                         ocr_result[order]["answer"] = new_ans
@@ -431,7 +486,6 @@ async def process_grading(exam_id: int, job_id: int):
             else:
                 logger.info("OCR结果可信，跳过纠错步骤")
 
-            # 删除临时预处理文件
             for proc_path in processed_paths:
                 if "_processed" in proc_path and os.path.exists(proc_path):
                     try:
@@ -439,7 +493,6 @@ async def process_grading(exam_id: int, job_id: int):
                     except:
                         pass
 
-            # 评分
             total_score = 0.0
             for q in questions:
                 qid = q["id"]
