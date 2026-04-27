@@ -110,7 +110,6 @@ def preprocess_image(image_path: str) -> str:
     logger.info(f"预处理完成: {processed_path}")
     return processed_path
 
-
 # ==================== 第一次识别：OCR ====================
 def ocr_only(image_paths: List[str], questions: List[dict]) -> Dict[int, dict]:
     """
@@ -120,11 +119,12 @@ def ocr_only(image_paths: List[str], questions: List[dict]) -> Dict[int, dict]:
         return {}
 
     num_questions = len(questions)
-    # 提示词（省略，保持原有完整内容）
+    # 提示词：保留原有所有细节，但输出格式改为 JSON 对象
     prompt = (
         "你是一个严格的光学字符识别（OCR）工具。\n"
-        "请分析图片中的学生答题卡，忽略所有印刷体题目描述、表格、得分栏等无关内容。\n"
-        f"请按顺序识别每个小题的学生答案。一共有 {num_questions} 道小题。\n"
+        f"本次发送了 {len(image_paths)} 张答题卡图片，请按顺序阅读所有图片，忽略印刷体题目描述、表格、得分栏等无关内容。\n"
+        "请识别每个小题的学生答案。\n"
+        f"一共有 {num_questions} 道小题，题号从 1 到 {num_questions}。\n"
         "小题的题号是普通数字加标点，例如“1.”、“2.”、“3.”。每个这样的题号代表一道独立的小题。\n"
         "注意：填空题的答案通常很短，可能是单个数字、字母或词语，请务必提取，不要忽略。\n"
         "重要：你需要准确识别学生手写答案中的数学符号和公式，包括但不限于：\n"
@@ -139,10 +139,10 @@ def ocr_only(image_paths: List[str], questions: List[dict]) -> Dict[int, dict]:
         "  - 集合符号：∈、∉、⊂、⊆、∪、∩、∅\n"
         "  - 逻辑符号：⇒、⇔、∀、∃\n"
         "  - 矩阵：用方括号表示，如 [a b; c d]\n"
-        "输出一个JSON数组，按题号顺序（1,2,3...）包含每个小题的学生答案。\n"
-        "重要：输出的答案中不要包含题号本身（例如不要输出“2、负实轴单位圆”，只需要输出“负实轴单位圆”）。\n"
-        "如果某道小题没有答案或无法识别，则对应位置输出空字符串。\n"
-        "严禁将多个小题的答案合并到一个数组元素中！\n"
+        "输出一个JSON对象，键为题号（字符串），值为对应的学生答案。例如：{\"1\": \"答案1\", \"2\": \"答案2\\n第二分点\", \"3\": \"\"}\n"
+        "同一道小题的多个分点（如带圈数字①、②、括号数字(1)、(2)等）必须合并为一个字符串，使用换行符分隔。\n"
+        "输出的答案中不要包含题号本身（例如不要输出“2、负实轴单位圆”，只需要输出“负实轴单位圆”）。\n"
+        "如果某道小题没有答案或无法识别，则对应键的值为空字符串。\n"
         "不要输出任何其他解释或标记。"
     )
 
@@ -186,22 +186,25 @@ def ocr_only(image_paths: List[str], questions: List[dict]) -> Dict[int, dict]:
     cleaned = re.sub(r'\s*```$', '', cleaned)
     logger.info(f"清理后的内容: {cleaned}")
 
+    # 解析 JSON 对象（优先），若得到数组则降级按顺序映射
     try:
         data = json.loads(cleaned)
-        if not isinstance(data, list):
-            match = re.search(r'\[.*\]', cleaned, re.DOTALL)
+        if isinstance(data, list):
+            # 后备：将数组转换为对象，键为序号（1-indexed）
+            logger.warning("模型返回数组，将按顺序映射到题号")
+            data = {str(i+1): val for i, val in enumerate(data)}
+        elif not isinstance(data, dict):
+            # 尝试提取对象
+            match = re.search(r'\{.*\}', cleaned, re.DOTALL)
             if match:
                 data = json.loads(match.group())
             else:
-                data = []
+                data = {}
     except Exception as e:
         logger.error(f"OCR JSON解析失败: {e}, 原始内容: {raw_result}")
-        data = []
+        data = {}
 
-    while len(data) < num_questions:
-        data.append("")
-    data = data[:num_questions]
-
+    # 答案清洗函数（仅过滤占位符，不作其他修改）
     def clean_answer(text: str) -> str:
         if not text:
             return ""
@@ -211,19 +214,15 @@ def ocr_only(image_paths: List[str], questions: List[dict]) -> Dict[int, dict]:
         ]
         for pat in placeholder_patterns:
             if re.match(pat, text.strip()):
-                logger.warning(f"检测到占位符文本，清空: {text}")
                 return ""
-        pattern = r'(?:^|\n)\s*(?:[①②③④⑤⑥⑦⑧⑨⑩]|\(\d+\)|\d+[\.、](?:\s|$))'
-        text = re.sub(pattern, '\n', text)
-        text = re.sub(r'\n+', '\n', text).strip()
         return text
 
-    cleaned_data = [clean_answer(ans) for ans in data]
-
     result = {}
-    for i, q in enumerate(questions):
+    for q in questions:
         order = q['question_order']
-        result[order] = {"exists": True, "answer": cleaned_data[i] if i < len(cleaned_data) else ""}
+        key = str(order)
+        answer = data.get(key, "")
+        result[order] = {"exists": True, "answer": clean_answer(answer)}
     return result
 
 # ==================== 第二次识别：纠错模型 ====================
@@ -491,6 +490,8 @@ async def process_grading(exam_id: int, job_id: int):
                     {"exam_id": exam_id, "student_id": student_id}
                 ).fetchall()
 
+            logger.info(f"学生 {student_id} - {student['name']} 共有 {len(images)} 张答题卡图片")
+
             if not images:
                 logger.warning(f"学生 {student_id} 无答题卡图片，跳过")
                 processed += 1
@@ -503,9 +504,11 @@ async def process_grading(exam_id: int, job_id: int):
                 continue
 
             original_paths = [row.file_path for row in images]
+
+            # 对每张图片分别预处理（可选，若预处理影响识别可改为直接使用 original_paths）
             processed_paths = [preprocess_image(p) for p in original_paths]
 
-            # 第一次 OCR 识别（防御性处理）
+            # 第一次 OCR 识别（直接使用多张图片列表）
             ocr_result = ocr_only(processed_paths, questions)
             if ocr_result is None:
                 ocr_result = {}
@@ -520,7 +523,7 @@ async def process_grading(exam_id: int, job_id: int):
                     logger.warning("第二次 ocr_only 返回 None")
                 original_answers = {order: info["answer"] for order, info in ocr_result.items()}
 
-            # 纠错步骤（仅当存在空白答案时触发）
+            # 纠错步骤（使用原始图片）
             need_correct = any(not ans.strip() for ans in original_answers.values())
             if need_correct:
                 logger.info("检测到空白答案，启动纠错模型...")
@@ -532,13 +535,10 @@ async def process_grading(exam_id: int, job_id: int):
             else:
                 logger.info("OCR结果无空白答案，跳过纠错步骤")
 
-            # ========== 合并主观题分点答案 ==========
-            # 注意：选择题、判断题独立，其余题型（包括填空题、简答题、计算题等）按连续块合并
-            merged_answers = merge_subjective_answers(questions, {order: info["answer"] for order, info in ocr_result.items()})
-            for order, new_ans in merged_answers.items():
-                ocr_result[order]["answer"] = new_ans
-                if new_ans != original_answers.get(order):
-                    logger.info(f"题目 {order} 答案已合并: 原='{original_answers.get(order)}' 新='{new_ans[:50]}...'")
+            # 合并主观题分点答案（基于原本的合并逻辑）
+            # merged_answers = merge_subjective_answers(questions, {order: info["answer"] for order, info in ocr_result.items()})
+            # for order, new_ans in merged_answers.items():
+            #     ocr_result[order]["answer"] = new_ans
 
             # 删除临时预处理文件
             for proc_path in processed_paths:
@@ -605,7 +605,6 @@ async def process_grading(exam_id: int, job_id: int):
                 {"job_id": job_id}
             )
             conn.commit()
-
 
 # ==================== API 端点 ====================
 @router.post("/api/exams/{exam_id}/grade")
