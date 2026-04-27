@@ -5,6 +5,10 @@
         <el-icon><Upload /></el-icon>
         从文件导入
       </el-button>
+      <el-button type="info" @click="downloadTemplate">
+        <el-icon><Download /></el-icon>
+        下载模板
+      </el-button>
       <el-button type="success" @click="showBatchAddDialog = true">
         <el-icon><DocumentAdd /></el-icon>
         批量添加
@@ -18,11 +22,11 @@
         刷新
       </el-button>
     </div>
-    
+
     <div style="margin-bottom: 15px;">
-      <el-button 
-        type="danger" 
-        @click="removeBatchStudents" 
+      <el-button
+        type="danger"
+        @click="removeBatchStudents"
         :disabled="selectedExamStudents.length === 0"
       >
         <el-icon><Delete /></el-icon>
@@ -30,10 +34,10 @@
       </el-button>
     </div>
 
-    <el-table 
+    <el-table
       ref="studentTableRef"
-      :data="examStudents" 
-      style="width: 100%" 
+      :data="examStudents"
+      style="width: 100%"
       row-key="student_id"
       @selection-change="handleExamStudentSelectionChange"
       @row-dblclick="handleExamStudentDblClick"
@@ -56,12 +60,12 @@
         <template #default="scope">
           <el-input
             v-if="editingRowId === scope.row.student_id"
-            v-model="scope.row.class_name"
+            v-model="scope.row.class"
             @blur="saveExamStudent(scope.row)"
             @keyup.enter="saveExamStudent(scope.row)"
             size="small"
           />
-          <span v-else>{{ scope.row.class_name }}</span>
+          <span v-else>{{ scope.row.class }}</span>
         </template>
       </el-table-column>
       <el-table-column label="姓名" width="120">
@@ -74,23 +78,6 @@
             size="small"
           />
           <span v-else>{{ scope.row.name }}</span>
-        </template>
-      </el-table-column>
-      <el-table-column label="联系方式">
-        <template #default="scope">
-          <div style="display: flex; align-items: center; justify-content: space-between;">
-            <el-input
-              v-if="editingRowId === scope.row.student_id"
-              v-model="scope.row.contact_info"
-              @blur="saveExamStudent(scope.row)"
-              @keyup.enter="saveExamStudent(scope.row)"
-              size="small"
-              style="margin-right: 10px;"
-            />
-            <span v-else style="margin-right: 10px;">{{ scope.row.contact_info }}</span>
-            
-            <el-icon class="drag-handle" style="cursor: move; color: #909399;"><Rank /></el-icon>
-          </div>
         </template>
       </el-table-column>
     </el-table>
@@ -195,7 +182,7 @@
         @row-dblclick="handleRowDblClick"
       >
         <el-table-column type="selection" width="55" />
-        
+
         <el-table-column label="学号" width="120">
           <template #default="scope">
             <el-input
@@ -213,12 +200,12 @@
           <template #default="scope">
             <el-input
               v-if="editingRowId === scope.row.student_id"
-              v-model="scope.row.class_name"
+              v-model="scope.row.class"
               @blur="saveStudent(scope.row)"
               @keyup.enter="saveStudent(scope.row)"
               size="small"
             />
-            <span v-else>{{ scope.row.class_name }}</span>
+            <span v-else>{{ scope.row.class }}</span>
           </template>
         </el-table-column>
 
@@ -232,19 +219,6 @@
               size="small"
             />
             <span v-else>{{ scope.row.name }}</span>
-          </template>
-        </el-table-column>
-
-        <el-table-column label="联系方式">
-          <template #default="scope">
-            <el-input
-              v-if="editingRowId === scope.row.student_id"
-              v-model="scope.row.contact_info"
-              @blur="saveStudent(scope.row)"
-              @keyup.enter="saveStudent(scope.row)"
-              size="small"
-            />
-            <span v-else>{{ scope.row.contact_info }}</span>
           </template>
         </el-table-column>
 
@@ -323,9 +297,9 @@
 <script setup>
 import { ref, onMounted, nextTick, watch, defineProps, defineEmits } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Upload, DocumentAdd, UploadFilled, Search, User, Refresh, Delete, Rank } from '@element-plus/icons-vue'
+import { Upload, DocumentAdd, UploadFilled, Search, User, Refresh, Delete, Rank, Download } from '@element-plus/icons-vue'
 import axios from 'axios'
- 
+
 const props = defineProps({
   examId: {
     type: String,
@@ -333,7 +307,7 @@ const props = defineProps({
   }
 })
 
-const emit = defineEmits(['update:students'])
+const emit = defineEmits(['update:students', 'refresh'])
 
 const examStudents = ref([])
 const allStudents = ref([])
@@ -416,10 +390,31 @@ const handleFileChange = (file) => {
   selectedFile.value = file.raw
 }
 
-// 保存学生信息
+// 下载模板
+const downloadTemplate = async () => {
+  try {
+    const response = await axios.get('http://localhost:8001/api/students/template', {
+      responseType: 'blob'
+    })
+    const url = window.URL.createObjectURL(new Blob([response.data]))
+    const link = document.createElement('a')
+    link.href = url
+    link.setAttribute('download', 'student_template.xlsx')
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    window.URL.revokeObjectURL(url)
+    ElMessage.success('模板下载成功')
+  } catch (error) {
+    console.error('下载模板失败:', error)
+    ElMessage.error('下载模板失败')
+  }
+}
+
+// 保存学生信息（在“添加已录入学生”对话框中）
 const saveStudent = async (student) => {
   if (editingRowId.value !== student.student_id) return
-  
+
   if (!student.name) {
     ElMessage.error('姓名不能为空')
     return
@@ -433,7 +428,7 @@ const saveStudent = async (student) => {
     const response = await axios.put(`http://localhost:8001/api/students/${student.student_id}`, {
       name: student.name,
       student_number: student.student_number,
-      class_name: student.class_name,
+      class: student.class,
       contact_info: student.contact_info
     })
 
@@ -454,10 +449,10 @@ const saveStudent = async (student) => {
   }
 }
 
-// 保存考试学生信息
+// 保存考试学生信息（在考试学生表格中）
 const saveExamStudent = async (student) => {
   if (editingRowId.value !== student.student_id) return
-  
+
   if (!student.name) {
     ElMessage.error('姓名不能为空')
     return
@@ -471,7 +466,7 @@ const saveExamStudent = async (student) => {
     const response = await axios.put(`http://localhost:8001/api/students/${student.student_id}`, {
       name: student.name,
       student_number: student.student_number,
-      class_name: student.class_name,
+      class: student.class,
       contact_info: student.contact_info
     })
 
@@ -552,7 +547,7 @@ const addSelectedStudents = async () => {
   }
 }
 
-// 添加学生到考试
+// 添加单个学生到考试（通过“添加已录入学生”中的选择）
 const addStudentToExam = async () => {
   try {
     const response = await axios.post(`http://localhost:8001/api/exams/${props.examId}/students`, selectedStudentId.value, {
@@ -610,7 +605,7 @@ const removeBatchStudents = async () => {
   }
 }
 
-// 批量添加学生
+// 批量添加学生（手动输入文本）
 const batchAddStudents = async () => {
   if (!batchAddText.value.trim()) {
     ElMessage.error('请输入学生信息')
@@ -626,7 +621,7 @@ const batchAddStudents = async () => {
       if (parts.length >= 1) {
         students.push({
           student_number: parts[0],
-          class_name: parts[1] || '',
+          class: parts[1] || '',
           name: parts[2] || '',
           contact_info: parts[3] || ''
         })
@@ -645,11 +640,11 @@ const batchAddStudents = async () => {
 
     if (response.data.code === 1) {
       const { added_count, errors } = response.data.data
-      
+
       if (errors && errors.length > 0) {
         const prefix = added_count > 0 ? `部分添加成功` : `批量添加失败`
         const errorMsg = `${prefix}：成功 ${added_count} 人，失败 ${errors.length} 人。原因：${errors.join('; ')}`
-        
+
         ElMessage.warning({
           message: errorMsg,
           duration: 5000,
@@ -660,7 +655,7 @@ const batchAddStudents = async () => {
       } else {
         ElMessage.success(`批量添加成功！共添加 ${added_count} 个学生`)
       }
-      
+
       showBatchAddDialog.value = false
       batchAddText.value = ''
       await fetchExamStudents()
@@ -694,7 +689,7 @@ const importStudentsFromFile = async () => {
       showFileImportDialog.value = false
       selectedFile.value = null
       await fetchExamStudents()
-      emit('refresh')   // 新增
+      emit('refresh')
     } else {
       ElMessage.error(response.data.msg || '文件导入失败')
     }
@@ -737,7 +732,7 @@ const initDragAndDrop = () => {
   tbody.addEventListener('dragstart', (e) => {
     const tr = e.target.closest('tr')
     if (!tr) return
-    
+
     draggingIndex = tr.sectionRowIndex
     e.dataTransfer.effectAllowed = 'move'
     e.dataTransfer.setData('text/plain', draggingIndex)
@@ -758,15 +753,15 @@ const initDragAndDrop = () => {
   tbody.addEventListener('dragenter', (e) => {
     const destTr = e.target.closest('tr')
     if (!destTr || draggingIndex === -1 || destTr.sectionRowIndex === draggingIndex) return
-    
+
     const destIndex = destTr.sectionRowIndex
-    
+
     const items = [...examStudents.value]
     const movedItem = items[draggingIndex]
     items.splice(draggingIndex, 1)
     items.splice(destIndex, 0, movedItem)
     examStudents.value = items
-    
+
     draggingIndex = destIndex
   })
 
@@ -787,7 +782,7 @@ watch(examStudents, () => {
 onMounted(async () => {
   await fetchExamStudents()
   await fetchAllStudents()
-  
+
   nextTick(() => {
     initDragAndDrop()
     ensureRowsDraggable()

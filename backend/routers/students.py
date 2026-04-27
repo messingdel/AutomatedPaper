@@ -4,9 +4,10 @@ from typing import Optional, List
 from sqlalchemy import text
 import logging
 import os
-import pandas as pd
 import io
-
+import re
+from fastapi.responses import StreamingResponse
+import pandas as pd
 from backend.database import engine
 
 # 配置日志
@@ -384,116 +385,190 @@ def get_available_students(exam_id: int, search: Optional[str] = None):
 async def import_students_from_file(exam_id: int, file: UploadFile = File(...)):
     """从文件导入学生信息到考试"""
     try:
-        # 验证考试是否存在
+        # 1. 验证考试是否存在
         with engine.connect() as conn:
-            exam_result = conn.execute(text("SELECT exam_id FROM exams WHERE exam_id = :exam_id"), {"exam_id": exam_id}).fetchone()
+            exam_result = conn.execute(
+                text("SELECT exam_id FROM exams WHERE exam_id = :exam_id"),
+                {"exam_id": exam_id}
+            ).fetchone()
             if not exam_result:
                 raise HTTPException(status_code=404, detail=f"考试 {exam_id} 不存在")
 
-        # 验证文件类型
+        # 2. 验证文件类型
         file_extension = os.path.splitext(file.filename)[1].lower()
         allowed_extensions = {'.xlsx', '.xls', '.txt', '.csv'}
         if file_extension not in allowed_extensions:
             raise HTTPException(status_code=400, detail="不支持的文件格式。支持: xlsx, xls, txt, csv")
 
-        # 读取文件内容
+        # 3. 读取文件内容
         content = await file.read()
         students_to_add = []
 
-        try:
-            if file_extension in {'.xlsx', '.xls'}:
-                # 处理Excel文件
-                df = pd.read_excel(io.BytesIO(content))
-                # 假设列顺序为：学号, 班级, 姓名, 联系方式
-                for _, row in df.iterrows():
-                    if len(row) >= 3 and pd.notna(row.iloc[0]) and pd.notna(row.iloc[2]):
-                        students_to_add.append({
-                            "student_number": str(row.iloc[0]).strip(),
-                            "class": str(row.iloc[1]).strip() if pd.notna(row.iloc[1]) else "",
-                            "name": str(row.iloc[2]).strip(),
-                            "contact_info": str(row.iloc[3]).strip() if len(row) > 3 and pd.notna(row.iloc[3]) else ""
-                        })
+        logger.info(f"开始导入文件: {file.filename}, 考试ID: {exam_id}")
+
+        if file_extension in {'.xlsx', '.xls'}:
+            # ---------- Excel 处理 ----------
+            # 强制所有列以字符串读取，避免数字变成浮点数
+            df = pd.read_excel(io.BytesIO(content), dtype=str, keep_default_na=False)
+            df = df.fillna('')  # NaN 替换为空字符串
+
+            # 记录原始列名
+            original_columns = df.columns.tolist()
+            logger.info(f"原始列名: {original_columns}")
+
+            # 清洗列名：去除首尾空格、不可见字符，转小写，并移除所有空格
+            cleaned_columns = [re.sub(r'\s+', '', str(col).strip().replace('\ufeff', '').lower()) for col in original_columns]
+            logger.info(f"清洗后列名: {cleaned_columns}")
+
+            # 定义关键字映射
+            keywords = {
+                'student_number': ['学号', 'student_number', '学籍号', '学号/工号'],
+                'class': ['班级', 'class', '班别', 'class_name'],
+                'name': ['姓名', 'name', '学生姓名', 'name']
+            }
+
+            # 匹配列索引
+            col_indices = {}
+            for key, kw_list in keywords.items():
+                matched = None
+                for idx, col in enumerate(cleaned_columns):
+                    for kw in kw_list:
+                        if kw in col:  # 子串匹配
+                            matched = idx
+                            break
+                    if matched is not None:
+                        break
+                if matched is not None:
+                    col_indices[key] = matched
+                elif key != 'class':
+                    raise HTTPException(status_code=400, detail=f"文件中未找到包含“{kw_list[0]}”的列")
+
+            logger.info(f"匹配到的列索引: {col_indices}")
+
+            # 提取数据
+            student_numbers = df.iloc[:, col_indices['student_number']].astype(str).str.strip()
+            names = df.iloc[:, col_indices['name']].astype(str).str.strip()
+            if 'class' in col_indices:
+                classes_raw = df.iloc[:, col_indices['class']].astype(str)
+                classes = classes_raw.str.strip()
+                # 打印前5行班级原始值和清洗后值
+                logger.info(f"班级列原始值（前5行）: {classes_raw.iloc[:5].tolist()}")
+                logger.info(f"班级列处理后（前5行）: {classes.iloc[:5].tolist()}")
             else:
-                # 处理文本文件
-                text_content = content.decode('utf-8')
-                lines = text_content.strip().split('\n')
+                classes = [''] * len(df)
+                logger.warning("未找到班级列，班级将设置为空字符串")
 
-                for line in lines:
-                    line = line.strip()
-                    if not line:
-                        continue
+            # 打印前几行数据预览
+            logger.info("数据预览（前3行）:")
+            for i in range(min(3, len(df))):
+                logger.info(f"  行{i+1}: 学号={student_numbers.iloc[i]}, 姓名={names.iloc[i]}, 班级={classes.iloc[i] if i < len(classes) else ''}")
 
-                    # 支持逗号和制表符分隔
-                    if '\t' in line:
-                        parts = line.split('\t')
-                    else:
-                        parts = line.split(',')
+            # 构建学生列表
+            for idx, (stu_num, name, cls) in enumerate(zip(student_numbers, names, classes)):
+                if not stu_num or not name:
+                    logger.warning(f"第 {idx+1} 行学号或姓名为空，跳过")
+                    continue
+                # 处理班级空值
+                if cls.lower() in ['nan', '']:
+                    cls = ''
+                students_to_add.append({
+                    "student_number": stu_num,
+                    "class": cls,
+                    "name": name,
+                    "contact_info": ""
+                })
+            logger.info(f"从Excel中提取到 {len(students_to_add)} 条学生记录")
 
-                    if len(parts) >= 3 and parts[0].strip() and parts[2].strip():
-                        students_to_add.append({
-                            "student_number": parts[0].strip(),
-                            "class": parts[1].strip(),
-                            "name": parts[2].strip(),
-                            "contact_info": parts[3].strip() if len(parts) > 3 else ""
-                        })
-        except Exception as parse_error:
-            raise HTTPException(status_code=400, detail=f"文件解析失败: {str(parse_error)}")
+        else:
+            # ---------- 文本文件处理 ----------
+            text_content = content.decode('utf-8')
+            lines = text_content.strip().split('\n')
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                if '\t' in line:
+                    parts = line.split('\t')
+                else:
+                    parts = line.split(',')
+                if len(parts) >= 3 and parts[0].strip() and parts[2].strip():
+                    students_to_add.append({
+                        "student_number": parts[0].strip(),
+                        "class": parts[1].strip() if len(parts) > 1 else "",
+                        "name": parts[2].strip(),
+                        "contact_info": parts[3].strip() if len(parts) > 3 else ""
+                    })
+            logger.info(f"从文本文件中提取到 {len(students_to_add)} 条学生记录")
 
         if not students_to_add:
             raise HTTPException(status_code=400, detail="文件中没有找到有效的学生信息")
 
-        # 添加学生到数据库
+        # 4. 导入数据库并关联到考试
         imported_count = 0
         with engine.connect() as conn:
-            for student_data in students_to_add:
+            for student in students_to_add:
                 try:
-                    # 检查学号是否已存在
+                    # 检查学生是否已存在
                     existing = conn.execute(
-                        text("SELECT student_id FROM students WHERE student_number = :student_number"),
-                        {"student_number": student_data["student_number"]}
+                        text("SELECT student_id, class FROM students WHERE student_number = :student_number"),
+                        {"student_number": student["student_number"]}
                     ).fetchone()
 
-                    student_id = None
-                    if not existing:
-                        # 创建新学生
+                    if existing:
+                        student_id = existing[0]
+                        current_class = existing[1] or ""
+                        if current_class != student["class"]:
+                            logger.info(f"更新学生 {student['student_number']} 班级: '{current_class}' -> '{student['class']}'")
+                            conn.execute(
+                                text("UPDATE students SET class = :class WHERE student_id = :student_id"),
+                                {"class": student["class"], "student_id": student_id}
+                            )
+                    else:
+                        # 插入新学生
                         result = conn.execute(
                             text("""INSERT INTO students (name, student_number, class, contact_info)
                                  VALUES (:name, :student_number, :class, :contact_info)"""),
                             {
-                                "name": student_data["name"],
-                                "student_number": student_data["student_number"],
-                                "class": student_data.get("class", ""),
-                                "contact_info": student_data.get("contact_info", "")
+                                "name": student["name"],
+                                "student_number": student["student_number"],
+                                "class": student["class"],
+                                "contact_info": student.get("contact_info", "")
                             }
                         )
                         student_id = result.lastrowid
-                    else:
-                        student_id = existing[0]
+                        logger.info(f"新增学生: {student['student_number']}, 班级: {student['class']}")
 
-                    # 将学生添加到考试（如果还没有）
+                    # 将学生添加到考试（如果尚未关联）
                     existing_relation = conn.execute(
-                       text("SELECT * FROM exam_students WHERE exam_id = :exam_id AND student_id = :student_id"),
+                        text("SELECT 1 FROM exam_students WHERE exam_id = :exam_id AND student_id = :student_id"),
                         {"exam_id": exam_id, "student_id": student_id}
                     ).fetchone()
-
                     if not existing_relation:
+                        max_sort = conn.execute(
+                            text("SELECT COALESCE(MAX(sort_order), 0) FROM exam_students WHERE exam_id = :exam_id"),
+                            {"exam_id": exam_id}
+                        ).scalar()
+                        new_sort = max_sort + 1
                         conn.execute(
-                            text("INSERT INTO exam_students (exam_id, student_id) VALUES (:exam_id, :student_id)"),
-                            {"exam_id": exam_id, "student_id": student_id}
+                            text("INSERT INTO exam_students (exam_id, student_id, sort_order) VALUES (:exam_id, :student_id, :sort_order)"),
+                            {"exam_id": exam_id, "student_id": student_id, "sort_order": new_sort}
                         )
                         imported_count += 1
-
+                        logger.info(f"关联学生 {student['student_number']} 到考试 {exam_id}")
+                    else:
+                        logger.debug(f"学生 {student['student_number']} 已存在于考试中")
                     conn.commit()
-                except Exception as student_error:
-                    logger.warning(f"添加学生失败 {student_data}: {str(student_error)}")
+                except Exception as inner_err:
+                    logger.error(f"处理学生 {student} 失败: {str(inner_err)}")
                     continue
 
+        logger.info(f"导入完成，成功关联 {imported_count} 个新学生到考试")
         return {"code": 1, "msg": "导入成功", "data": {"imported_count": imported_count}}
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"文件导入失败: {str(e)}")
+        logger.error(f"文件导入失败: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"文件导入失败: {str(e)}")
 
 @router.post("/api/exams/{exam_id}/add-existing-students")
@@ -585,3 +660,27 @@ def remove_students_batch(exam_id: int, student_ids: List[int] = Body(...)):
     except Exception as e:
         logger.error(f"批量删除学生失败: {str(e)}")
         raise HTTPException(status_code=500, detail=f"批量删除学生失败: {str(e)}")
+
+
+@router.get("/api/students/template")
+async def export_student_template():
+    """导出学生信息导入模板（Excel 文件，包含表头：序号、学号、班级、姓名）"""
+    try:
+        # 创建 DataFrame，包含四列：序号、学号、班级、姓名
+        df = pd.DataFrame(columns=['序号', '学号', '班级', '姓名'])
+
+        # 写入内存中的字节流
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name='学生模板')
+        output.seek(0)
+
+        # 返回文件
+        return StreamingResponse(
+            output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": "attachment; filename=student_template.xlsx"}
+        )
+    except Exception as e:
+        logger.error(f"导出模板失败: {str(e)}")
+        raise HTTPException(status_code=500, detail="导出模板失败")

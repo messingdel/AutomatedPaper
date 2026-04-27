@@ -120,7 +120,7 @@ def ocr_only(image_paths: List[str], questions: List[dict]) -> Dict[int, dict]:
         return {}
 
     num_questions = len(questions)
-    # 修改提示词，强调不要输出题号
+    # 提示词（省略，保持原有完整内容）
     prompt = (
         "你是一个严格的光学字符识别（OCR）工具。\n"
         "请分析图片中的学生答题卡，忽略所有印刷体题目描述、表格、得分栏等无关内容。\n"
@@ -186,7 +186,6 @@ def ocr_only(image_paths: List[str], questions: List[dict]) -> Dict[int, dict]:
     cleaned = re.sub(r'\s*```$', '', cleaned)
     logger.info(f"清理后的内容: {cleaned}")
 
-    # 解析 JSON 数组
     try:
         data = json.loads(cleaned)
         if not isinstance(data, list):
@@ -199,16 +198,13 @@ def ocr_only(image_paths: List[str], questions: List[dict]) -> Dict[int, dict]:
         logger.error(f"OCR JSON解析失败: {e}, 原始内容: {raw_result}")
         data = []
 
-    # 确保长度与题目数一致
     while len(data) < num_questions:
         data.append("")
     data = data[:num_questions]
 
-    # ========== 修改点：增强清洗函数，移除题号前缀（包括数字加顿号） ==========
     def clean_answer(text: str) -> str:
         if not text:
             return ""
-        # 过滤明显的占位符
         placeholder_patterns = [
             r'^答案\d+$', r'^实际答案\d+$', r'^填空答案$', r'^示例答案$',
             r'^学生答案$', r'^答案$', r'^未识别$'
@@ -217,14 +213,18 @@ def ocr_only(image_paths: List[str], questions: List[dict]) -> Dict[int, dict]:
             if re.match(pat, text.strip()):
                 logger.warning(f"检测到占位符文本，清空: {text}")
                 return ""
-        # 移除题号前缀（支持：数字加点/顿号、带圈数字、括号数字）
-        # 修改点：数字加点/顿号后面必须跟空格或行尾，避免误删 "2.5" 中的点
         pattern = r'(?:^|\n)\s*(?:[①②③④⑤⑥⑦⑧⑨⑩]|\(\d+\)|\d+[\.、](?:\s|$))'
         text = re.sub(pattern, '\n', text)
-        # 合并连续换行符，去除首尾空白
         text = re.sub(r'\n+', '\n', text).strip()
         return text
 
+    cleaned_data = [clean_answer(ans) for ans in data]
+
+    result = {}
+    for i, q in enumerate(questions):
+        order = q['question_order']
+        result[order] = {"exists": True, "answer": cleaned_data[i] if i < len(cleaned_data) else ""}
+    return result
 
 # ==================== 第二次识别：纠错模型 ====================
 def correct_answers_with_image(image_paths: List[str], original_answers: Dict[int, str], questions: List[dict]) -> Dict[int, str]:
@@ -372,6 +372,10 @@ def score_only(question: dict, student_answer: str) -> float:
 
 # ==================== 辅助处理函数 ====================
 def merge_subjective_answers(questions: List[dict], answers: Dict[int, str]) -> Dict[int, str]:
+    """
+    合并连续的非选择题、非判断题的主观题答案（包括 essay, calculation 等）。
+    选择题、判断题保持独立。
+    """
     if not questions:
         return answers.copy()
 
@@ -381,19 +385,21 @@ def merge_subjective_answers(questions: List[dict], answers: Dict[int, str]) -> 
     while i < n:
         q = questions[i]
         order = q['question_order']
-        q_type = q.get('type', '主观题')
+        q_type = q.get('type', 'essay')
+        logger.info(f"处理题目 {order}: type={q_type}")
 
-        # 独立题型：选择题、判断题、填空题
-        if q_type in ['选择题', '判断题', '填空题']:
+        # 选择题、判断题独立（根据实际英文值调整）
+        if q_type in ['choice', 'judge', 'fill_blank']:   # 如果您的题型是 'choice_question' 等，请修改
             merged[order] = answers.get(order, "")
             i += 1
             continue
 
-        # 其他主观题：连续块合并
+        # 其他题型（essay, calculation等）按连续块合并
         block_orders = []
         j = i
-        while j < n and questions[j].get('type', '主观题') not in ['选择题', '判断题', '填空题']:
+        while j < n and questions[j].get('type', 'essay') not in ['choice', 'judge']:
             block_orders.append(questions[j]['question_order'])
+            logger.info(f"  加入块: {questions[j]['question_order']} (type={questions[j].get('type')})")
             j += 1
 
         if block_orders:
@@ -403,8 +409,10 @@ def merge_subjective_answers(questions: List[dict], answers: Dict[int, str]) -> 
             merged[first] = combined
             for other in block_orders[1:]:
                 merged[other] = ""
-            if len(block_orders) > 1:
-                logger.info(f"合并主观题块 {block_orders}")
+            logger.info(f"合并块 {block_orders} -> 合并后答案长度 {len(combined)}")
+        else:
+            # 处理单个独立的主观题（如无分点）
+            merged[order] = answers.get(order, "")
 
         i = j
 
@@ -497,15 +505,22 @@ async def process_grading(exam_id: int, job_id: int):
             original_paths = [row.file_path for row in images]
             processed_paths = [preprocess_image(p) for p in original_paths]
 
+            # 第一次 OCR 识别（防御性处理）
             ocr_result = ocr_only(processed_paths, questions)
+            if ocr_result is None:
+                ocr_result = {}
+                logger.warning("ocr_only 返回 None，使用空字典")
             original_answers = {order: info["answer"] for order, info in ocr_result.items()}
 
             if all(len(ans) == 0 for ans in original_answers.values()):
                 logger.warning("预处理后OCR结果为空，尝试使用原始图片重新识别...")
                 ocr_result = ocr_only(original_paths, questions)
+                if ocr_result is None:
+                    ocr_result = {}
+                    logger.warning("第二次 ocr_only 返回 None")
                 original_answers = {order: info["answer"] for order, info in ocr_result.items()}
 
-            # ========== 修改点：纠错触发条件优化 ==========
+            # 纠错步骤（仅当存在空白答案时触发）
             need_correct = any(not ans.strip() for ans in original_answers.values())
             if need_correct:
                 logger.info("检测到空白答案，启动纠错模型...")
@@ -518,10 +533,14 @@ async def process_grading(exam_id: int, job_id: int):
                 logger.info("OCR结果无空白答案，跳过纠错步骤")
 
             # ========== 合并主观题分点答案 ==========
+            # 注意：选择题、判断题独立，其余题型（包括填空题、简答题、计算题等）按连续块合并
             merged_answers = merge_subjective_answers(questions, {order: info["answer"] for order, info in ocr_result.items()})
             for order, new_ans in merged_answers.items():
                 ocr_result[order]["answer"] = new_ans
+                if new_ans != original_answers.get(order):
+                    logger.info(f"题目 {order} 答案已合并: 原='{original_answers.get(order)}' 新='{new_ans[:50]}...'")
 
+            # 删除临时预处理文件
             for proc_path in processed_paths:
                 if "_processed" in proc_path and os.path.exists(proc_path):
                     try:
@@ -529,6 +548,7 @@ async def process_grading(exam_id: int, job_id: int):
                     except:
                         pass
 
+            # 评分
             total_score = 0.0
             for q in questions:
                 qid = q["id"]
