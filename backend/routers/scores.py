@@ -303,3 +303,107 @@ def export_exam_scores(exam_id: int):
     except Exception as e:
         logger.error(f"导出成绩失败: {str(e)}")
         raise HTTPException(status_code=500, detail=f"导出失败: {str(e)}")
+
+@router.get("/api/exams/{exam_id}/export-objective")
+def export_objective_answers(exam_id: int):
+    """导出选择题和填空题的学生答案到 Excel"""
+    try:
+        with engine.connect() as conn:
+            # 1. 获取考试信息
+            exam = conn.execute(
+                text("SELECT exam_id, exam_name FROM exams WHERE exam_id = :exam_id"),
+                {"exam_id": exam_id}
+            ).fetchone()
+            if not exam:
+                raise HTTPException(status_code=404, detail="考试不存在")
+
+            # 2. 获取该考试的所有客观题（选择题、填空题）
+            questions_result = conn.execute(
+                text("""
+                    SELECT q.id, q.content, q.reference_answer, eq.question_order
+                    FROM questions q
+                    INNER JOIN exam_questions eq ON q.id = eq.question_id
+                    WHERE eq.exam_id = :exam_id
+                        AND q.type IN ('选择题', '填空题', 'choice', 'fill_blank')
+                    ORDER BY eq.question_order
+                """),
+                {"exam_id": exam_id}
+            )
+            questions = [dict(row._mapping) for row in questions_result.fetchall()]
+            if not questions:
+                raise HTTPException(status_code=400, detail="该考试没有选择题或填空题")
+
+            # 3. 获取所有学生（已关联该考试）
+            students_result = conn.execute(
+                text("""
+                    SELECT s.student_id, s.student_number, s.name, s.class
+                    FROM students s
+                    INNER JOIN exam_students es ON s.student_id = es.student_id
+                    WHERE es.exam_id = :exam_id
+                    ORDER BY es.sort_order
+                """),
+                {"exam_id": exam_id}
+            )
+            students = [dict(row._mapping) for row in students_result.fetchall()]
+            if not students:
+                raise HTTPException(status_code=400, detail="该考试没有学生")
+
+            # 4. 获取每个学生每道客观题的答案和得分
+            scores_result = conn.execute(
+                text("""
+                    SELECT student_id, question_id, student_answer, score
+                    FROM student_scores
+                    WHERE exam_id = :exam_id
+                """),
+                {"exam_id": exam_id}
+            )
+            answer_map = {}
+            for row in scores_result:
+                sid = row.student_id
+                qid = row.question_id
+                if sid not in answer_map:
+                    answer_map[sid] = {}
+                answer_map[sid][qid] = {
+                    "answer": row.student_answer or "",
+                    "score": row.score
+                }
+
+            # 5. 构建 Excel 数据
+            rows = []
+            for student in students:
+                sid = student["student_id"]
+                row_data = {
+                    "学号": student["student_number"],
+                    "姓名": student["name"],
+                    "班级": student["class"],
+                }
+                for q in questions:
+                    qid = q["id"]
+                    info = answer_map.get(sid, {}).get(qid, {})
+                    row_data[f"第{q['question_order']}题\n学生答案"] = info.get("answer", "")
+                    row_data[f"第{q['question_order']}题\n参考答案"] = q["reference_answer"] or ""
+                    row_data[f"第{q['question_order']}题\n得分"] = info.get("score", "")
+                rows.append(row_data)
+
+            df = pd.DataFrame(rows)
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                df.to_excel(writer, sheet_name="客观题答案", index=False)
+                # 调整列宽
+                worksheet = writer.sheets["客观题答案"]
+                for i, col in enumerate(df.columns):
+                    max_len = max(df[col].astype(str).map(len).max(), len(col)) + 2
+                    worksheet.set_column(i, i, min(max_len, 30))
+            output.seek(0)
+
+            filename = f"exam_{exam.exam_name}_{exam_id}_objective_answers.xlsx"
+            return StreamingResponse(
+                output,
+                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"}
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"导出客观题答案失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"导出失败: {str(e)}")

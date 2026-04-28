@@ -5,21 +5,25 @@
       <p>使用人工智能对学生的答卷进行自动评分和分析</p>
     </div>
 
-    <div class="ai-grading-actions">
-      <el-button
-        type="success"
-        size="large"
-        @click="triggerAIGrading"
-        :loading="aiGradingInProgress"
-      >
-        <el-icon><Cpu /></el-icon>
-        开始AI阅卷
-      </el-button>
-      <el-button @click="refreshAll">
-        <el-icon><Refresh /></el-icon>
-        刷新状态
-      </el-button>
-    </div>
+  <div class="ai-grading-actions">
+    <el-button
+      type="success"
+      size="large"
+      @click="triggerAIGrading"
+      :loading="aiGradingInProgress"
+    >
+      <el-icon><Cpu /></el-icon>
+      开始AI阅卷
+    </el-button>
+    <el-button @click="refreshAll">
+      <el-icon><Refresh /></el-icon>
+      刷新状态
+    </el-button>
+    <el-button type="info" @click="exportObjectiveAnswers">
+      <el-icon><Download /></el-icon>
+      导出客观题答案
+    </el-button>
+  </div>
 
     <div class="ai-grading-status" v-if="aiGradingInProgress">
       <el-progress :percentage="aiGradingProgress" :status="aiGradingStatus" />
@@ -135,7 +139,7 @@
 <script setup>
 import { ref, computed, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Cpu, Refresh } from '@element-plus/icons-vue'
+import { Cpu, Refresh, Download } from '@element-plus/icons-vue'
 import axios from 'axios'
 
 const props = defineProps({
@@ -341,6 +345,27 @@ const triggerAIGrading = async () => {
 const refreshAll = () => {
   emit('refresh')
   fetchStudentScores()
+}
+
+// 导出选择题和填空题答案
+const exportObjectiveAnswers = async () => {
+  try {
+    const response = await axios.get(`/api/exams/${props.examId}/export-objective`, {
+      responseType: 'blob'
+    })
+    const url = window.URL.createObjectURL(new Blob([response.data]))
+    const link = document.createElement('a')
+    link.href = url
+    link.setAttribute('download', `exam_${props.examId}_objective_answers.xlsx`)
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    window.URL.revokeObjectURL(url)
+    ElMessage.success('导出成功')
+  } catch (error) {
+    console.error('导出失败:', error)
+    ElMessage.error('导出失败')
+  }
 }
 
 onMounted(() => {
