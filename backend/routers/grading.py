@@ -11,10 +11,6 @@ import base64
 import json
 from typing import List, Dict
 
-# 新增导入
-import cv2
-import numpy as np
-
 from backend.database import engine, get_db
 from backend.config import MM_MODEL_CONFIG
 
@@ -39,78 +35,7 @@ class StartGradingResponse(BaseModel):
     data: dict
 
 
-# ==================== 温和的图像预处理函数 ====================
-def preprocess_image(image_path: str) -> str:
-    """
-    对答题卡图片进行温和预处理：灰度化 + CLAHE增强 + 轻量去噪 + 可选透视校正。
-    不进行二值化和形态学操作，保留图像细节，适合多模态模型直接识别。
-    生成临时文件，原始文件不变。
-    """
-    img = cv2.imread(image_path)
-    if img is None:
-        logger.warning(f"无法读取图片: {image_path}")
-        return image_path
-
-    # 1. 灰度化
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    # 2. CLAHE 增强对比度
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    enhanced = clahe.apply(gray)
-
-    # 3. 轻量去噪（双边滤波保留边缘）
-    denoised = cv2.bilateralFilter(enhanced, 9, 75, 75)
-
-    # 4. 可选：透视校正（默认关闭，可通过参数开启）
-    def apply_perspective_correction(img, enable=False):
-        if not enable:
-            return img
-        try:
-            _, binary = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if contours:
-                max_contour = max(contours, key=cv2.contourArea)
-                epsilon = 0.02 * cv2.arcLength(max_contour, True)
-                approx = cv2.approxPolyDP(max_contour, epsilon, True)
-                if len(approx) == 4:
-                    pts = approx.reshape(4, 2)
-                    # 排序四个角点（左上、右上、右下、左下）
-                    rect = np.zeros((4, 2), dtype=np.float32)
-                    s = pts.sum(axis=1)
-                    rect[0] = pts[np.argmin(s)]
-                    rect[2] = pts[np.argmax(s)]
-                    diff = np.diff(pts, axis=1)
-                    rect[1] = pts[np.argmin(diff)]
-                    rect[3] = pts[np.argmax(diff)]
-                    # 计算目标尺寸
-                    w1 = np.linalg.norm(rect[1] - rect[0])
-                    w2 = np.linalg.norm(rect[2] - rect[3])
-                    h1 = np.linalg.norm(rect[3] - rect[0])
-                    h2 = np.linalg.norm(rect[2] - rect[1])
-                    dst_w = int(max(w1, w2))
-                    dst_h = int(max(h1, h2))
-                    dst = np.array([[0, 0], [dst_w - 1, 0], [dst_w - 1, dst_h - 1], [0, dst_h - 1]], dtype=np.float32)
-                    M = cv2.getPerspectiveTransform(rect, dst)
-                    img = cv2.warpPerspective(img, M, (dst_w, dst_h))
-        except Exception as e:
-            logger.warning(f"透视校正失败: {e}")
-        return img
-
-    # 调用透视校正（此处 enable=False 关闭）
-    denoised = apply_perspective_correction(denoised, enable=False)
-
-    # 增加边缘填充（防止顶部信息丢失）
-    border_size = 20
-    denoised = cv2.copyMakeBorder(denoised, border_size, border_size, border_size, border_size, cv2.BORDER_CONSTANT,
-                                  value=255)
-    # 保存临时文件（灰度图，非二值）
-    base, ext = os.path.splitext(image_path)
-    processed_path = f"{base}_processed{ext}"
-    cv2.imwrite(processed_path, denoised)
-    logger.info(f"预处理完成: {processed_path}")
-    return processed_path
-
-# ==================== 第一次识别：OCR ====================
+# ==================== OCR 识别函数 ====================
 def ocr_only(image_paths: List[str], questions: List[dict]) -> Dict[int, dict]:
     """
     第一次识别：使用多模态模型提取学生手写答案，返回 { order: {"exists": True, "answer": str} }
@@ -119,7 +44,6 @@ def ocr_only(image_paths: List[str], questions: List[dict]) -> Dict[int, dict]:
         return {}
 
     num_questions = len(questions)
-    # 提示词：保留原有所有细节，但输出格式改为 JSON 对象
     prompt = (
         "你是一个严格的光学字符识别（OCR）工具。\n"
         f"本次发送了 {len(image_paths)} 张答题卡图片，请按顺序阅读所有图片，忽略印刷体题目描述、表格、得分栏等无关内容。\n"
@@ -143,6 +67,10 @@ def ocr_only(image_paths: List[str], questions: List[dict]) -> Dict[int, dict]:
         "同一道小题的多个分点（如带圈数字①、②、括号数字(1)、(2)等）必须合并为一个字符串，使用换行符分隔。\n"
         "输出的答案中不要包含题号本身（例如不要输出“2、负实轴单位圆”，只需要输出“负实轴单位圆”）。\n"
         "如果某道小题没有答案或无法识别，则对应键的值为空字符串。\n"
+        "特别重要：对于**选择题**，你必须为每个题号单独输出一个键值对，严禁将多个选择题的答案合并到一个键中！\n"
+        "例如，如果图片中有四道选择题，答案分别是 'A', 'B', 'C', 'D'，你必须输出："
+        "{\"1\": \"A\", \"2\": \"B\", \"3\": \"C\", \"4\": \"D\"}，而不是 {\"1\": \"A B C D\"} 或 {\"1\": \"A2.B3.C4.D\"}。\n"
+        "每个题号只能对应一个答案，不能把一个题号的答案字符串中包含其他题号的标识。\n"
         "不要输出任何其他解释或标记。"
     )
 
@@ -190,11 +118,9 @@ def ocr_only(image_paths: List[str], questions: List[dict]) -> Dict[int, dict]:
     try:
         data = json.loads(cleaned)
         if isinstance(data, list):
-            # 后备：将数组转换为对象，键为序号（1-indexed）
             logger.warning("模型返回数组，将按顺序映射到题号")
             data = {str(i+1): val for i, val in enumerate(data)}
         elif not isinstance(data, dict):
-            # 尝试提取对象
             match = re.search(r'\{.*\}', cleaned, re.DOTALL)
             if match:
                 data = json.loads(match.group())
@@ -204,7 +130,6 @@ def ocr_only(image_paths: List[str], questions: List[dict]) -> Dict[int, dict]:
         logger.error(f"OCR JSON解析失败: {e}, 原始内容: {raw_result}")
         data = {}
 
-    # 答案清洗函数（仅过滤占位符，不作其他修改）
     def clean_answer(text: str) -> str:
         if not text:
             return ""
@@ -225,7 +150,8 @@ def ocr_only(image_paths: List[str], questions: List[dict]) -> Dict[int, dict]:
         result[order] = {"exists": True, "answer": clean_answer(answer)}
     return result
 
-# ==================== 第二次识别：纠错模型 ====================
+
+# ==================== 纠错模型 ====================
 def correct_answers_with_image(image_paths: List[str], original_answers: Dict[int, str], questions: List[dict]) -> Dict[int, str]:
     """使用多模态模型对OCR答案进行纠错，返回纠正后的答案字典"""
     if not image_paths:
@@ -310,10 +236,8 @@ def score_only(question: dict, student_answer: str) -> float:
     reference = question.get('reference_answer', '')
 
     if q_type in ['选择题', '填空题', '判断题']:
-        # ========== 修改点：保留希腊字母和其他数学符号 ==========
         def normalize(s):
             s = s.strip().lower()
-            # 保留字母、数字、汉字、希腊字母(\u0370-\u03ff)、常用数学符号、竖线、方括号等
             s = re.sub(r'[^\w\u4e00-\u9fff\u0370-\u03ff\+\-\*/=<>≤≥≠√∑∫∂\|\[\]]', '', s)
             return s
         std_ref = normalize(reference)
@@ -369,12 +293,10 @@ def score_only(question: dict, student_answer: str) -> float:
         logger.error(f"评分调用失败: {e}")
         return 0.0
 
+
 # ==================== 辅助处理函数 ====================
 def merge_subjective_answers(questions: List[dict], answers: Dict[int, str]) -> Dict[int, str]:
-    """
-    合并连续的非选择题、非判断题的主观题答案（包括 essay, calculation 等）。
-    选择题、判断题保持独立。
-    """
+    """合并连续的非选择题、非判断题的主观题答案"""
     if not questions:
         return answers.copy()
 
@@ -387,18 +309,15 @@ def merge_subjective_answers(questions: List[dict], answers: Dict[int, str]) -> 
         q_type = q.get('type', 'essay')
         logger.info(f"处理题目 {order}: type={q_type}")
 
-        # 选择题、判断题独立（根据实际英文值调整）
-        if q_type in ['choice', 'judge', 'fill_blank']:   # 如果您的题型是 'choice_question' 等，请修改
+        if q_type in ['choice', 'judge', 'fill_blank']:
             merged[order] = answers.get(order, "")
             i += 1
             continue
 
-        # 其他题型（essay, calculation等）按连续块合并
         block_orders = []
         j = i
         while j < n and questions[j].get('type', 'essay') not in ['choice', 'judge']:
             block_orders.append(questions[j]['question_order'])
-            logger.info(f"  加入块: {questions[j]['question_order']} (type={questions[j].get('type')})")
             j += 1
 
         if block_orders:
@@ -408,14 +327,140 @@ def merge_subjective_answers(questions: List[dict], answers: Dict[int, str]) -> 
             merged[first] = combined
             for other in block_orders[1:]:
                 merged[other] = ""
-            logger.info(f"合并块 {block_orders} -> 合并后答案长度 {len(combined)}")
         else:
-            # 处理单个独立的主观题（如无分点）
             merged[order] = answers.get(order, "")
-
         i = j
 
     return merged
+
+
+def reorder_answers_by_reference(questions: List[dict], answers: Dict[int, str]) -> Dict[int, str]:
+    """根据参考答案重新分配答案顺序（主要用于填空题和选择题）"""
+    new_answers = answers.copy()
+    target_orders = []
+    ref_map = {}
+    for q in questions:
+        q_type = q.get('type', '')
+        if q_type in ['填空题', '选择题', 'fill_blank', 'choice']:
+            order = q['question_order']
+            target_orders.append(order)
+            ref_map[order] = q.get('reference_answer', '').strip()
+
+    if not target_orders:
+        return new_answers
+
+    candidate_answers = [answers.get(o, '').strip() for o in target_orders]
+    used_indices = set()
+
+    for order in target_orders:
+        ref = ref_map.get(order, '')
+        if not ref:
+            continue
+
+        best_match = None
+        best_idx = -1
+        for idx, cand in enumerate(candidate_answers):
+            if idx in used_indices:
+                continue
+            if cand == ref:
+                best_match = cand
+                best_idx = idx
+                break
+            cand_clean = re.sub(r'[^\w\u4e00-\u9fff]', '', cand)
+            ref_clean = re.sub(r'[^\w\u4e00-\u9fff]', '', ref)
+            if cand_clean == ref_clean:
+                best_match = cand
+                best_idx = idx
+                break
+            if ref.isdigit() and cand.isdigit():
+                best_match = cand
+                best_idx = idx
+                break
+
+        if best_match is not None:
+            new_answers[order] = best_match
+            used_indices.add(best_idx)
+
+    return new_answers
+
+
+def split_combined_choices(questions: List[dict], answers: Dict[int, str]) -> Dict[int, str]:
+    """将合并的选择题答案拆分为独立题号的答案"""
+    new_answers = answers.copy()
+    choice_orders = [q['question_order'] for q in questions if q.get('type') in ['选择题', 'choice']]
+    for q in questions:
+        if q.get('type') not in ['选择题', 'choice']:
+            continue
+        order = q['question_order']
+        text = answers.get(order, '')
+        if not text:
+            continue
+
+        # 1. 标准模式：数字+字母
+        pattern = r'(\d+)[\.、，,\s]*([A-Za-z])'
+        matches = list(re.finditer(pattern, text))
+        if len(matches) > 1:
+            for match in matches:
+                num = int(match.group(1))
+                letter = match.group(2).upper()
+                if num in choice_orders:
+                    new_answers[num] = letter
+            continue
+
+        # 2. 反向模式：字母+数字
+        pattern2 = r'([A-Za-z])(\d+)'
+        matches2 = list(re.finditer(pattern2, text))
+        if matches2:
+            for match in matches2:
+                letter = match.group(1).upper()
+                num = int(match.group(2))
+                if num in choice_orders:
+                    new_answers[num] = letter
+            continue
+
+        # 3. 纯字母点分隔
+        if re.match(r'^[A-Za-z\.]+$', text):
+            parts = text.split('.')
+            for idx, part in enumerate(parts):
+                if part and idx < len(choice_orders):
+                    new_answers[choice_orders[idx]] = part.upper()
+            continue
+
+        # 4. 特定混合处理
+        letters = re.findall(r'([A-Za-z])', text)
+        numbers = re.findall(r'(\d+)', text)
+        if letters and numbers:
+            for num_str, letter in zip(numbers, letters):
+                num = int(num_str)
+                if num in choice_orders:
+                    new_answers[num] = letter.upper()
+            if len(letters) > len(numbers) and choice_orders:
+                new_answers[choice_orders[0]] = letters[0].upper()
+    return new_answers
+
+
+def split_combined_fillblanks(questions: List[dict], answers: Dict[int, str]) -> Dict[int, str]:
+    """将合并的填空题答案拆分为独立题号的答案"""
+    new_answers = answers.copy()
+    fill_orders = [q['question_order'] for q in questions if q.get('type') in ['填空题', 'fill_blank']]
+    if not fill_orders:
+        return new_answers
+
+    for order in fill_orders:
+        text = answers.get(order, '')
+        if not text.strip():
+            continue
+
+        pattern = r'(\d+)[\.、:：）)\s]+([^0-9]+?(?=\s*\d+[\.、:：）)])|$)'
+        matches = list(re.finditer(pattern, text, re.DOTALL))
+        if len(matches) >= 2:
+            for match in matches:
+                num = int(match.group(1))
+                ans = match.group(2).strip()
+                if num in fill_orders:
+                    new_answers[num] = ans
+    return new_answers
+
 
 # ==================== 后台阅卷任务 ====================
 async def process_grading(exam_id: int, job_id: int):
@@ -452,6 +497,7 @@ async def process_grading(exam_id: int, job_id: int):
             )
             conn.commit()
 
+            # 获取题目列表
             questions_result = conn.execute(
                 text("""
                      SELECT q.id, q.type, q.content, q.reference_answer, q.scoring_rules,
@@ -479,10 +525,11 @@ async def process_grading(exam_id: int, job_id: int):
             student_id = student["student_id"]
             logger.info(f"处理学生 {student_id} - {student['name']}")
 
+            # 修改点：优先使用预处理后的图片
             with engine.connect() as conn:
                 images = conn.execute(
                     text("""
-                    SELECT file_path
+                    SELECT COALESCE(processed_file_path, file_path) as file_path
                     FROM answer_sheets
                     WHERE exam_id = :exam_id AND student_id = :student_id
                     ORDER BY page_order
@@ -503,50 +550,57 @@ async def process_grading(exam_id: int, job_id: int):
                     conn.commit()
                 continue
 
-            original_paths = [row.file_path for row in images]
+            # 直接使用已有的图片路径（可能是预处理后的图片）
+            image_paths = [row.file_path for row in images]
 
-            # 对每张图片分别预处理（可选，若预处理影响识别可改为直接使用 original_paths）
-            processed_paths = [preprocess_image(p) for p in original_paths]
-
-            # 第一次 OCR 识别（直接使用多张图片列表）
-            ocr_result = ocr_only(processed_paths, questions)
+            # 第一次 OCR 识别
+            ocr_result = ocr_only(image_paths, questions)
             if ocr_result is None:
                 ocr_result = {}
                 logger.warning("ocr_only 返回 None，使用空字典")
             original_answers = {order: info["answer"] for order, info in ocr_result.items()}
 
+            # 如果全部为空，尝试使用原始图片再次识别（此逻辑保留）
             if all(len(ans) == 0 for ans in original_answers.values()):
-                logger.warning("预处理后OCR结果为空，尝试使用原始图片重新识别...")
-                ocr_result = ocr_only(original_paths, questions)
+                logger.warning("预处理图片OCR结果为空，尝试使用原始图片重新识别...")
+                with engine.connect() as conn:
+                    fallback_images = conn.execute(
+                        text("""
+                        SELECT file_path
+                        FROM answer_sheets
+                        WHERE exam_id = :exam_id AND student_id = :student_id
+                        ORDER BY page_order
+                        """),
+                        {"exam_id": exam_id, "student_id": student_id}
+                    ).fetchall()
+                fallback_paths = [row.file_path for row in fallback_images]
+                ocr_result = ocr_only(fallback_paths, questions)
                 if ocr_result is None:
                     ocr_result = {}
                     logger.warning("第二次 ocr_only 返回 None")
                 original_answers = {order: info["answer"] for order, info in ocr_result.items()}
 
-            # 纠错步骤（使用原始图片）
-            need_correct = any(not ans.strip() for ans in original_answers.values())
-            if need_correct:
-                logger.info("检测到空白答案，启动纠错模型...")
-                corrected_answers = correct_answers_with_image(original_paths, original_answers, questions)
-                for order, new_ans in corrected_answers.items():
-                    if new_ans:
-                        ocr_result[order]["answer"] = new_ans
-                        logger.info(f"纠正题目 {order}: {original_answers[order]} -> {new_ans}")
-            else:
-                logger.info("OCR结果无空白答案，跳过纠错步骤")
+            logger.info("已禁用纠错模型，直接使用OCR结果")
 
-            # 合并主观题分点答案（基于原本的合并逻辑）
-            # merged_answers = merge_subjective_answers(questions, {order: info["answer"] for order, info in ocr_result.items()})
-            # for order, new_ans in merged_answers.items():
-            #     ocr_result[order]["answer"] = new_ans
+            # 拆分选择题答案
+            split_answers = split_combined_choices(questions, {order: info["answer"] for order, info in ocr_result.items()})
+            for order, new_ans in split_answers.items():
+                if new_ans:
+                    ocr_result[order]["answer"] = new_ans
+                    logger.info(f"拆分选择题 {order}: 新答案 = {new_ans}")
 
-            # 删除临时预处理文件
-            for proc_path in processed_paths:
-                if "_processed" in proc_path and os.path.exists(proc_path):
-                    try:
-                        os.remove(proc_path)
-                    except:
-                        pass
+            # 拆分填空题答案
+            split_fill_answers = split_combined_fillblanks(questions, {order: info["answer"] for order, info in ocr_result.items()})
+            for order, new_ans in split_fill_answers.items():
+                if new_ans != ocr_result[order]["answer"]:
+                    ocr_result[order]["answer"] = new_ans
+                    logger.info(f"拆分填空题 {order}: 新答案 = {new_ans}")
+
+            # 根据参考答案重排序
+            reordered = reorder_answers_by_reference(questions,
+                                                     {order: info["answer"] for order, info in ocr_result.items()})
+            for order, ans in reordered.items():
+                ocr_result[order]["answer"] = ans
 
             # 评分
             total_score = 0.0
@@ -605,6 +659,7 @@ async def process_grading(exam_id: int, job_id: int):
                 {"job_id": job_id}
             )
             conn.commit()
+
 
 # ==================== API 端点 ====================
 @router.post("/api/exams/{exam_id}/grade")

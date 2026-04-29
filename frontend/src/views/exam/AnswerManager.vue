@@ -20,10 +20,10 @@
               class="image-item"
             >
               <el-image
-                :src="getImageUrl(img.file_path)"
+                :src="getImageUrl(img)"
                 fit="cover"
                 class="image-thumb"
-                :preview-src-list="[getImageUrl(img.file_path)]"
+                :preview-src-list="[getImageUrl(img)]"
               />
               <div class="image-actions">
                 <el-input-number
@@ -126,12 +126,13 @@ const uploadFileList = ref([])
 // 上传文件夹状态
 const folderUploading = ref(false)
 
-// 获取图片基础URL
-const getImageUrl = (filePath) => {
-  let relative = filePath;
-  if (relative.startsWith('./')) relative = relative.slice(2);
-  if (relative.startsWith('uploads/')) relative = relative.slice(8);
-  return `http://localhost:8001/uploads/${relative}`;
+// 获取图片URL（优先使用预处理后的图片）
+const getImageUrl = (img) => {
+  const filePath = img.processed_file_path || img.file_path
+  let relative = filePath
+  if (relative.startsWith('./')) relative = relative.slice(2)
+  if (relative.startsWith('uploads/')) relative = relative.slice(8)
+  return `http://localhost:8001/uploads/${relative}`
 }
 
 // 获取考试所有学生的图片并组装数据
