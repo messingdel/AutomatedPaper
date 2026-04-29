@@ -152,18 +152,43 @@ def ocr_only(image_paths: List[str], questions: List[dict]) -> Dict[int, dict]:
 
 
 # ==================== 纠错模型 ====================
-def correct_answers_with_image(image_paths: List[str], original_answers: Dict[int, str], questions: List[dict]) -> Dict[int, str]:
-    """使用多模态模型对OCR答案进行纠错，返回纠正后的答案字典"""
+def correct_answers_with_image(
+    image_paths: List[str],
+    original_answers: Dict[int, str],
+    questions: List[dict]
+) -> Dict[int, str]:
+    """
+    使用多模态模型对OCR答案进行纠错，返回纠正后的答案字典。
+    提示词中加入题型信息，要求选择题只输出字母。
+    """
     if not image_paths:
         return {}
 
-    num_questions = len(questions)
-    answers_text = "\n".join([f"第{q['question_order']}题: {original_answers.get(q['question_order'], '')}" for q in questions])
+    # 构建每道题的题型说明
+    q_descriptions = []
+    for q in questions:
+        order = q['question_order']
+        q_type = q.get('type', 'essay')
+        q_content = q.get('content', '')[:50]  # 截取前50字
+        if q_type in ('choice', '选择题'):
+            type_hint = "选择题，答案只能是一个英文字母(A/B/C/D等)，不要数字、汉字或其他符号"
+        elif q_type in ('fill_blank', '填空题'):
+            type_hint = "填空题，答案可能是词语、数字或短句"
+        elif q_type in ('true_false', '判断题'):
+            type_hint = "判断题，答案应为'正确'/'错误'或'√'/'×'"
+        else:
+            type_hint = "主观题，答案可能是较长的文字"
+        q_descriptions.append(
+            f"第{order}题（{type_hint}）：原识别结果 = '{original_answers.get(order, '')}'"
+        )
+
     prompt = (
-        f"以下是OCR工具从答题卡图片中识别出的学生答案，可能包含错误。请根据图片中实际的学生手写内容，纠正这些答案。\n"
-        f"原始识别结果：\n{answers_text}\n"
-        "请按题号顺序输出纠正后的答案，格式为JSON数组，例如：[\"纠正后的答案1\", \"纠正后的答案2\", ...]。\n"
-        "如果原始答案正确，则保持不变；如果无法识别，输出空字符串。注意保留数学符号和公式（包括绝对值竖线）。不要输出其他内容。"
+        "你是一个纠错工具，需要根据答题卡图片纠正OCR识别结果。\n"
+        "以下是各题目的题型和原始识别结果，请结合题目类型判断原始答案是否合理，并给出最终答案。\n"
+        "特别要求：选择题的答案必须只包含一个英文字母，不允许出现数字、汉字或标点。\n"
+        + "\n".join(q_descriptions) +
+        "\n\n请输出一个JSON对象，键为题号（字符串），值为纠正后的答案。"
+        "如果无法识别，则对应值为空字符串。不要输出其他内容。"
     )
 
     content = [{"text": prompt}]
@@ -186,7 +211,8 @@ def correct_answers_with_image(image_paths: List[str], original_answers: Dict[in
     raw_result = ""
     for attempt in range(MM_MODEL_CONFIG["max_retries"]):
         try:
-            resp = requests.post(MM_MODEL_CONFIG["api_url"], headers=headers, json=body, timeout=MM_MODEL_CONFIG["timeout"])
+            resp = requests.post(MM_MODEL_CONFIG["api_url"], headers=headers, json=body,
+                                 timeout=MM_MODEL_CONFIG["timeout"])
             resp.raise_for_status()
             result = resp.json()
             raw_result = result["output"]["choices"][0]["message"]["content"][0]["text"]
@@ -205,23 +231,24 @@ def correct_answers_with_image(image_paths: List[str], original_answers: Dict[in
     cleaned = re.sub(r'\s*```$', '', cleaned)
     try:
         data = json.loads(cleaned)
-        if not isinstance(data, list):
-            match = re.search(r'\[.*\]', cleaned, re.DOTALL)
+        if isinstance(data, list):
+            logger.warning("纠错返回数组，转换为字典")
+            data = {str(i+1): val for i, val in enumerate(data)}
+        elif not isinstance(data, dict):
+            match = re.search(r'\{.*\}', cleaned, re.DOTALL)
             if match:
                 data = json.loads(match.group())
             else:
-                data = []
+                data = {}
     except Exception as e:
         logger.error(f"纠错JSON解析失败: {e}, 原始内容: {raw_result}")
-        data = []
-
-    while len(data) < num_questions:
-        data.append("")
-    data = data[:num_questions]
+        data = {}
 
     corrected = {}
-    for i, q in enumerate(questions):
-        corrected[q['question_order']] = data[i] if i < len(data) else ""
+    for q in questions:
+        order = q['question_order']
+        key = str(order)
+        corrected[order] = data.get(key, original_answers.get(order, ""))
     return corrected
 
 
@@ -385,7 +412,7 @@ def reorder_answers_by_reference(questions: List[dict], answers: Dict[int, str])
 
 
 def split_combined_choices(questions: List[dict], answers: Dict[int, str]) -> Dict[int, str]:
-    """将合并的选择题答案拆分为独立题号的答案"""
+    import re
     new_answers = answers.copy()
     choice_orders = [q['question_order'] for q in questions if q.get('type') in ['选择题', 'choice']]
     for q in questions:
@@ -418,7 +445,7 @@ def split_combined_choices(questions: List[dict], answers: Dict[int, str]) -> Di
                     new_answers[num] = letter
             continue
 
-        # 3. 纯字母点分隔
+        # 3. 纯字母点分隔（如 A.B.C.D）
         if re.match(r'^[A-Za-z\.]+$', text):
             parts = text.split('.')
             for idx, part in enumerate(parts):
@@ -426,7 +453,7 @@ def split_combined_choices(questions: List[dict], answers: Dict[int, str]) -> Di
                     new_answers[choice_orders[idx]] = part.upper()
             continue
 
-        # 4. 特定混合处理
+        # 4. 混合模式处理
         letters = re.findall(r'([A-Za-z])', text)
         numbers = re.findall(r'(\d+)', text)
         if letters and numbers:
@@ -436,12 +463,51 @@ def split_combined_choices(questions: List[dict], answers: Dict[int, str]) -> Di
                     new_answers[num] = letter.upper()
             if len(letters) > len(numbers) and choice_orders:
                 new_answers[choice_orders[0]] = letters[0].upper()
+            continue
+
+        # 5. 多字母空格/点分隔（如 "A B C D" 或 "A.B.C.D"），分配给连续选择题
+        if re.fullmatch(r'[A-Za-z\s\.]+', text):
+            letters = re.findall(r'[A-Za-z]', text)
+            if len(letters) > 1:
+                try:
+                    start_idx = choice_orders.index(order)
+                except ValueError:
+                    start_idx = -1
+                if start_idx >= 0 and start_idx + len(letters) <= len(choice_orders):
+                    for i, letter in enumerate(letters):
+                        target_order = choice_orders[start_idx + i]
+                        new_answers[target_order] = letter.upper()
+                    continue
+
+        # 6. 单题答案带题号前缀，如 "1. A" → "A"
+        clean_text = re.sub(r'^\s*\d+[\.、:：）)]\s*', '', text).strip()
+        if clean_text and clean_text != text:
+            new_answers[order] = clean_text
+
+    # ===== 最终清理：剔除明显不是选择题答案的长文本/乱码 =====
+    for order in choice_orders:
+        ans = new_answers.get(order, '')
+        if not ans:
+            continue
+        # 只允许：纯字母，或最多 4 个由空格/点分隔的字母（如 "A" "A B" "A.B.D"）
+        if re.fullmatch(r'[A-Za-z](?:\s*[\.\s]\s*[A-Za-z]){0,3}', ans):
+            continue
+        # 长度异常或包含汉字/数字 → 判定为错位答案，清空
+        if len(ans) > 5 or re.search(r'[\u4e00-\u9fff\d]', ans):
+            logger.warning(f"选择题 {order} 答案异常（疑似其他题目内容），已清空: '{ans}'")
+            new_answers[order] = ''
+
     return new_answers
 
 
 def split_combined_fillblanks(questions: List[dict], answers: Dict[int, str]) -> Dict[int, str]:
-    """将合并的填空题答案拆分为独立题号的答案"""
+    """
+    将合并的填空题答案拆分为独立题号的答案，同时去除单题答案中的题号前缀。
+    """
+    import re
     new_answers = answers.copy()
+
+    # 收集所有填空题的题号（按顺序）
     fill_orders = [q['question_order'] for q in questions if q.get('type') in ['填空题', 'fill_blank']]
     if not fill_orders:
         return new_answers
@@ -451,14 +517,23 @@ def split_combined_fillblanks(questions: List[dict], answers: Dict[int, str]) ->
         if not text.strip():
             continue
 
-        pattern = r'(\d+)[\.、:：）)\s]+([^0-9]+?(?=\s*\d+[\.、:：）)])|$)'
+        # 1. 先尝试多题号拆解模式：数字+分隔符+内容
+        pattern = r'(\d+)[\.、:：）)\s]+([^0-9]+?(?=\s*\d+[\.、:：）)]|$)'
         matches = list(re.finditer(pattern, text, re.DOTALL))
+
         if len(matches) >= 2:
+            # 多题号合并，拆解并剥离题号
             for match in matches:
                 num = int(match.group(1))
                 ans = match.group(2).strip()
                 if num in fill_orders:
                     new_answers[num] = ans
+        else:
+            # 单题答案，检查是否以“数字+标点”开头
+            # 例如 "1. 北京" → 剥离为 "北京"
+            cleaned = re.sub(r'^\s*\d+[\.、:：）)]\s*', '', text)
+            if cleaned != text:
+                new_answers[order] = cleaned
     return new_answers
 
 
@@ -580,8 +655,6 @@ async def process_grading(exam_id: int, job_id: int):
                     logger.warning("第二次 ocr_only 返回 None")
                 original_answers = {order: info["answer"] for order, info in ocr_result.items()}
 
-            logger.info("已禁用纠错模型，直接使用OCR结果")
-
             # 拆分选择题答案
             split_answers = split_combined_choices(questions, {order: info["answer"] for order, info in ocr_result.items()})
             for order, new_ans in split_answers.items():
@@ -601,6 +674,31 @@ async def process_grading(exam_id: int, job_id: int):
                                                      {order: info["answer"] for order, info in ocr_result.items()})
             for order, ans in reordered.items():
                 ocr_result[order]["answer"] = ans
+
+            # ---------- 选择题答案合法性检查，触发条件纠错 ----------
+            choice_orders = [q['question_order'] for q in questions if q.get('type') in ('choice', '选择题')]
+            invalid_choices = []
+            for order in choice_orders:
+                ans = ocr_result.get(order, {}).get("answer", "")
+                # 只允许字母、空格，且至少要有一个字母
+                if ans.strip() and not re.fullmatch(r'[A-Za-z\s]+', ans):
+                    invalid_choices.append(order)
+                    logger.warning(f"选择题 {order} 答案异常: '{ans}'")
+
+            if invalid_choices:
+                logger.info(f"发现 {len(invalid_choices)} 道选择题答案异常，调用纠错模型...")
+                # 注意：这里使用原始图片路径（未预处理）可能更稳定？但已用预处理图片，效果通常更好
+                corrected_answers = correct_answers_with_image(image_paths,
+                                                               {order: info["answer"] for order, info in
+                                                                ocr_result.items()},
+                                                               questions)
+                for order, new_ans in corrected_answers.items():
+                    if order in invalid_choices and new_ans != ocr_result[order]["answer"]:
+                        logger.info(f"纠错覆盖选择题 {order}: '{ocr_result[order]['answer']}' -> '{new_ans}'")
+                        ocr_result[order]["answer"] = new_ans
+            else:
+                logger.info("所有选择题答案格式正常，跳过纠错模型")
+            # -------------------------------------------------------------
 
             # 评分
             total_score = 0.0

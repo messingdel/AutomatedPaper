@@ -5,25 +5,25 @@
       <p>使用人工智能对学生的答卷进行自动评分和分析</p>
     </div>
 
-  <div class="ai-grading-actions">
-    <el-button
-      type="success"
-      size="large"
-      @click="triggerAIGrading"
-      :loading="aiGradingInProgress"
-    >
-      <el-icon><Cpu /></el-icon>
-      开始AI阅卷
-    </el-button>
-    <el-button @click="refreshAll">
-      <el-icon><Refresh /></el-icon>
-      刷新状态
-    </el-button>
-    <el-button type="info" @click="exportObjectiveAnswers">
-      <el-icon><Download /></el-icon>
-      导出客观题答案
-    </el-button>
-  </div>
+    <div class="ai-grading-actions">
+      <el-button
+        type="success"
+        size="large"
+        @click="triggerAIGrading"
+        :loading="aiGradingInProgress"
+      >
+        <el-icon><Cpu /></el-icon>
+        开始AI阅卷
+      </el-button>
+      <el-button @click="refreshAll">
+        <el-icon><Refresh /></el-icon>
+        刷新状态
+      </el-button>
+      <el-button type="info" @click="exportObjectiveAnswers">
+        <el-icon><Download /></el-icon>
+        导出客观题答案
+      </el-button>
+    </div>
 
     <div class="ai-grading-status" v-if="aiGradingInProgress">
       <el-progress :percentage="aiGradingProgress" :status="aiGradingStatus" />
@@ -58,19 +58,13 @@
         <span>学生答题详情</span>
       </template>
       <el-table :data="studentScoreList" border v-loading="loadingScores">
+        <!-- 新增序号列 -->
+        <el-table-column type="index" label="序号" width="60" />
         <el-table-column prop="name" label="姓名" width="120" />
         <el-table-column prop="student_number" label="学号" width="150" />
         <el-table-column label="总分" width="100">
           <template #default="{ row }">
             {{ row.total_score !== null ? row.total_score : '未评分' }}
-          </template>
-        </el-table-column>
-        <el-table-column label="识别状态" width="120">
-          <template #default="{ row }">
-            <el-tag v-if="row.total_score === null" type="info" size="small">未阅卷</el-tag>
-            <el-tag v-else-if="row.has_missing" type="warning" size="small">有缺失</el-tag>
-            <el-tag v-else-if="row.has_unrecognized" type="danger" size="small">未识别</el-tag>
-            <el-tag v-else type="success" size="small">全部识别</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="操作" width="100">
@@ -94,13 +88,6 @@
           <template #default="{ row }">
             <span v-if="row.student_answer === null">（题目缺失）</span>
             <span v-else>{{ row.student_answer || '（未识别）' }}</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="识别状态" width="100">
-          <template #default="{ row }">
-            <el-tag v-if="row.student_answer === null" type="info" size="small">题目缺失</el-tag>
-            <el-tag v-else-if="row.student_answer === ''" type="danger" size="small">未识别</el-tag>
-            <el-tag v-else type="success" size="small">已识别</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="得分" width="220">
@@ -186,26 +173,8 @@ const fetchStudentScores = async () => {
     if (res.data.code === 1) {
       const data = res.data.data
       examTotalScore.value = data.exam_info?.total_score ?? null
-      const students = data.students || []
-      for (const s of students) {
-        if (s.total_score === null) {
-          s.has_missing = false
-          s.has_unrecognized = false
-          continue
-        }
-        let hasMissing = false
-        let hasUnrecognized = false
-        for (const q of s.question_scores || []) {
-          if (q.student_answer === null) {
-            hasMissing = true
-          } else if (q.student_answer === '') {
-            hasUnrecognized = true
-          }
-        }
-        s.has_missing = hasMissing
-        s.has_unrecognized = hasUnrecognized && !hasMissing  // 如果已有缺失，不再显示未识别
-      }
-      studentScoreList.value = students
+      // 直接使用后端数据，不再添加识别状态标记
+      studentScoreList.value = data.students || []
     } else {
       ElMessage.error(res.data.msg || '获取成绩失败')
     }
@@ -239,7 +208,6 @@ const updateScore = async (question) => {
     return
   }
 
-  // 计算更新后的总分
   let newTotal = 0
   for (const q of currentStudent.value.question_scores) {
     if (q.question_id === questionId) {
@@ -374,17 +342,72 @@ onMounted(() => {
 </script>
 
 <style scoped>
-.ai-grading-container { padding: 20px; display: flex; flex-direction: column; gap: 24px; }
-.ai-grading-header { text-align: center; }
-.ai-grading-header h3 { margin: 0 0 8px 0; color: #374151; font-size: 1.5rem; font-weight: 600; }
-.ai-grading-header p { margin: 0; color: #6b7280; font-size: 1rem; }
-.ai-grading-actions { display: flex; justify-content: center; gap: 16px; flex-wrap: wrap; }
-.ai-grading-status { text-align: center; padding: 20px; background: #f9fafb; border-radius: 8px; }
-.ai-grading-status p { margin: 12px 0 0 0; color: #374151; font-weight: 500; }
-.ai-grading-info { margin-top: 24px; }
-.stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; margin-top: 16px; }
-.stat-item { text-align: center; padding: 20px; background: #f9fafb; border-radius: 8px; transition: all 0.2s; }
-.stat-item:hover { background: #f3f4f6; transform: translateY(-2px); }
-.stat-value { font-size: 2rem; font-weight: bold; color: #3b82f6; margin-bottom: 8px; }
-.stat-label { font-size: 0.9rem; color: #6b7280; font-weight: 500; }
+.ai-grading-container {
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+.ai-grading-header {
+  text-align: center;
+}
+.ai-grading-header h3 {
+  margin: 0 0 8px 0;
+  color: #374151;
+  font-size: 1.5rem;
+  font-weight: 600;
+}
+.ai-grading-header p {
+  margin: 0;
+  color: #6b7280;
+  font-size: 1rem;
+}
+.ai-grading-actions {
+  display: flex;
+  justify-content: center;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.ai-grading-status {
+  text-align: center;
+  padding: 20px;
+  background: #f9fafb;
+  border-radius: 8px;
+}
+.ai-grading-status p {
+  margin: 12px 0 0 0;
+  color: #374151;
+  font-weight: 500;
+}
+.ai-grading-info {
+  margin-top: 24px;
+}
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 24px;
+  margin-top: 16px;
+}
+.stat-item {
+  text-align: center;
+  padding: 20px;
+  background: #f9fafb;
+  border-radius: 8px;
+  transition: all 0.2s;
+}
+.stat-item:hover {
+  background: #f3f4f6;
+  transform: translateY(-2px);
+}
+.stat-value {
+  font-size: 2rem;
+  font-weight: bold;
+  color: #3b82f6;
+  margin-bottom: 8px;
+}
+.stat-label {
+  font-size: 0.9rem;
+  color: #6b7280;
+  font-weight: 500;
+}
 </style>

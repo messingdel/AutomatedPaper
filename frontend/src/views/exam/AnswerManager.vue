@@ -8,6 +8,8 @@
 
     <!-- 学生表格（每个学生一行，展示其多张图片） -->
     <el-table :data="studentList" style="width: 100%" row-key="student_id">
+      <!-- 新增序号列 -->
+      <el-table-column type="index" label="序号" width="60" />
       <el-table-column prop="student_number" label="学号" width="120" />
       <el-table-column prop="name" label="姓名" width="100" />
       <el-table-column prop="class" label="班级" width="120" />
