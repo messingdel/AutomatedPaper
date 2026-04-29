@@ -44,6 +44,20 @@
               <span>{{ currentTotalScore }} 分</span>
             </div>
           </div>
+
+          <!-- 第三行：每生图片数设置 -->
+          <div class="info-row third-row">
+            <div class="info-item">
+              <label>每生图片数：</label>
+              <el-input-number
+                v-model="exam.images_per_student"
+                :min="1"
+                :max="20"
+                size="small"
+                @change="updateImagesPerStudent"
+              />
+            </div>
+          </div>
         </div>
       </el-card>
 
@@ -53,9 +67,9 @@
           <!-- 学生信息 -->
           <el-tab-pane label="学生信息" name="students">
             <div class="tab-content">
-              <StudentManager 
-                :exam-id="examId" 
-                @update:students="handleStudentsUpdate" 
+              <StudentManager
+                :exam-id="examId"
+                @update:students="handleStudentsUpdate"
               />
             </div>
           </el-tab-pane>
@@ -63,9 +77,9 @@
           <!-- 参考答案和题目信息 -->
           <el-tab-pane label="参考答案和题目信息" name="questions">
             <div class="tab-content">
-              <QuestionManager 
-                :exam-id="examId" 
-                @update:questions="handleQuestionsUpdate" 
+              <QuestionManager
+                :exam-id="examId"
+                @update:questions="handleQuestionsUpdate"
               />
             </div>
           </el-tab-pane>
@@ -73,38 +87,39 @@
           <!-- 学生作答管理-->
           <el-tab-pane label="学生作答管理" name="images">
             <div class="tab-content">
-              <AnswerManager 
-                :exam-id="examId" 
-                :students="examStudents" 
+              <AnswerManager
+                :exam-id="examId"
+                :students="examStudents"
+                :images-per-student="exam.images_per_student || 4"
               />
             </div>
           </el-tab-pane>
-          
+
 
           <!-- AI阅卷 -->
           <el-tab-pane label="AI阅卷" name="ai-grading">
             <div class="tab-content">
-              <AIGradingConsole 
-                :exam-id="examId" 
+              <AIGradingConsole
+                :exam-id="examId"
                 :scores="gradingStats"
                 :total-students="examStudents.length"
                 @refresh="fetchGradingStas"
               />
             </div>
           </el-tab-pane>
-          
+
 
           <!-- 成绩管理 -->
           <el-tab-pane label="成绩管理" name="scores">
             <div class="tab-content">
-              <ScoreManager 
+              <ScoreManager
                 :scores="scoreList"
-                :exam-id="examId" 
+                :exam-id="examId"
                 @refresh="fetchScores"
               />
             </div>
           </el-tab-pane>
-          
+
         </el-tabs>
       </el-card>
     </div>
@@ -192,9 +207,27 @@ const fetchExam = async () => {
     const response = await axios.get(`http://localhost:8001/api/exams`)
     const exams = response.data.data || []
     exam.value = exams.find(e => e.exam_id == examId)
+    if (exam.value && exam.value.images_per_student === undefined) {
+      exam.value.images_per_student = 4
+    }
   } catch (error) {
     console.error('获取考试信息失败:', error)
     ElMessage.error('获取考试信息失败')
+  }
+}
+
+
+// 更新每生图片数
+const updateImagesPerStudent = async () => {
+  if (!exam.value) return
+  try {
+    await axios.put(`http://localhost:8001/api/exams/${examId}`, {
+      images_per_student: exam.value.images_per_student
+    })
+    ElMessage.success('每生图片数已更新')
+  } catch (error) {
+    console.error('更新失败:', error)
+    ElMessage.error('更新失败')
   }
 }
 
@@ -447,6 +480,11 @@ onMounted(() => {
   gap: 8px;
   min-width: 0;
 }
+
+.info-row.third-row {
+  margin-top: 8px;
+}
+
 
 .reference-answer-info {
   display: flex;

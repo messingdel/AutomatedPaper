@@ -42,6 +42,7 @@ class ExamUpdate(BaseModel):
     total_questions: Optional[int] = None
     total_score: Optional[int] = None
     status: Optional[str] = None
+    images_per_student: Optional[int] = None   # 新增
 
     @field_validator('exam_date', mode='before')
     @classmethod
@@ -58,6 +59,7 @@ def get_exams():
     """获取所有考试列表"""
     try:
         with engine.connect() as conn:
+            # 如果原查询是 SELECT *，则 images_per_student 会自动包含
             result = conn.execute(text("SELECT * FROM exams ORDER BY created_at DESC"))
             rows = result.fetchall()
             exams = []
@@ -71,14 +73,15 @@ def get_exams():
                     'updated_at': row.updated_at.isoformat() if row.updated_at else None,
                     'status': row.status,
                     'total_questions': row.total_questions,
-                    'total_score': row.total_score
+                    'total_score': row.total_score,
+                    'images_per_student': row.images_per_student   # 新增，若 SELECT * 则已存在，否则需显式添加
                 }
                 exams.append(exam)
 
-            # 获取每个考试的学生数量
+            # 获取每个考试的学生数量（可选）
             for exam in exams:
                 student_count = conn.execute(
-                    text("SELECT COUNT(*) as count FROM exam_students WHERE exam_id = :exam_id"),
+                    text("SELECT COUNT(*) FROM exam_students WHERE exam_id = :exam_id"),
                     {"exam_id": exam['exam_id']}
                 ).scalar()
                 exam['student_count'] = student_count
@@ -119,7 +122,6 @@ def update_exam(exam_id: int, exam: ExamUpdate):
     """更新考试信息"""
     try:
         with engine.connect() as conn:
-            # 构建动态更新语句
             update_fields = []
             update_params = {"exam_id": exam_id}
 
@@ -141,7 +143,13 @@ def update_exam(exam_id: int, exam: ExamUpdate):
             if exam.status is not None:
                 update_fields.append("status = :status")
                 update_params["status"] = exam.status
-                update_fields.append("updated_at = CURRENT_TIMESTAMP")
+            # 新增：处理 images_per_student
+            if exam.images_per_student is not None:
+                update_fields.append("images_per_student = :images_per_student")
+                update_params["images_per_student"] = exam.images_per_student
+
+            # 添加更新时间戳（如果表中没有自动更新）
+            update_fields.append("updated_at = CURRENT_TIMESTAMP")
 
             if not update_fields:
                 return {"code": 0, "msg": "没有更新字段"}

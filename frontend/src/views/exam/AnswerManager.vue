@@ -1,6 +1,5 @@
 <template>
   <div class="answer-manager">
-    <!-- 工具栏 -->
     <div class="tab-actions">
       <el-button type="primary" @click="openUploadDialog">上传图片</el-button>
       <el-button @click="fetchStudentImages">刷新</el-button>
@@ -14,18 +13,11 @@
       <el-table-column prop="class" label="班级" width="120" />
       <el-table-column label="答题卡图片" min-width="400">
         <template #default="{ row }">
-          <div
-              class="images-container"
-              @dragover.prevent
-              @drop="handleDrop($event, row.student_id)"
-          >
+          <div class="images-container">
             <div
               v-for="img in row.images"
               :key="img.id"
               class="image-item"
-              draggable="true"
-              @dragstart="handleDragStart($event, img, row.student_id)"
-              @dragend="handleDragEnd"
             >
               <el-image
                 :src="getImageUrl(img.file_path)"
@@ -110,12 +102,16 @@ import axios from 'axios'
 
 const props = defineProps({
   examId: {
-    type: String,
+    type: [String, Number],
     required: true
   },
   students: {
     type: Array,
-    default: () => []   // 默认空数组，避免 undefined
+    default: () => []
+  },
+  imagesPerStudent: {
+    type: Number,
+    default: 4
   }
 })
 
@@ -127,17 +123,11 @@ const showUploadDialog = ref(false)
 const uploadStudentId = ref(null)
 const uploadFileList = ref([])
 
-// 上传文件夹内容
+// 上传文件夹状态
 const folderUploading = ref(false)
-
-// 拖拽相关状态
-const draggingImage = ref(null)
-const draggingSourceStudentId = ref(null)
 
 // 获取图片基础URL
 const getImageUrl = (filePath) => {
-  // 如果 filePath 已经是相对路径（如 "answer_sheets/1/xxx.jpg"），直接拼接
-  // 或者如果包含 "uploads/" 前缀，则去掉后拼接
   let relative = filePath;
   if (relative.startsWith('./')) relative = relative.slice(2);
   if (relative.startsWith('uploads/')) relative = relative.slice(8);
@@ -147,7 +137,6 @@ const getImageUrl = (filePath) => {
 // 获取考试所有学生的图片并组装数据
 const fetchStudentImages = async () => {
   try {
-    // 1. 获取该考试的所有学生（通过后端接口，假设已有 /api/exams/{examId}/students）
     const studentsRes = await axios.get(`http://localhost:8001/api/exams/${props.examId}/students`)
     if (studentsRes.data.code !== 1) {
       ElMessage.error('获取学生列表失败')
@@ -155,7 +144,6 @@ const fetchStudentImages = async () => {
     }
     const students = studentsRes.data.data
 
-    // 2. 获取该考试的所有图片
     const imagesRes = await axios.get(`http://localhost:8001/api/exams/${props.examId}/images`)
     if (imagesRes.data.code !== 1) {
       ElMessage.error('获取图片列表失败')
@@ -163,7 +151,6 @@ const fetchStudentImages = async () => {
     }
     const images = imagesRes.data.data
 
-    // 3. 按学生分组图片
     const imgMap = new Map()
     for (const img of images) {
       const sid = img.student.student_id
@@ -171,7 +158,6 @@ const fetchStudentImages = async () => {
       imgMap.get(sid).push(img)
     }
 
-    // 4. 组装学生列表，每个学生附带其图片（并按 page_order 排序）
     const list = students.map(student => ({
       ...student,
       images: (imgMap.get(student.student_id) || []).sort((a, b) => a.page_order - b.page_order)
@@ -194,7 +180,7 @@ const openUploadDialog = () => {
   showUploadDialog.value = true
 }
 
-// 上传图片
+// 上传图片（单学生多张）
 const uploadImages = async () => {
   if (!uploadStudentId.value) {
     ElMessage.error('请选择学生')
@@ -265,7 +251,7 @@ const updateImageOrder = async (img) => {
       await fetchStudentImages()
     } else {
       ElMessage.error(response.data.msg || '更新失败')
-      await fetchStudentImages() // 刷新恢复原值
+      await fetchStudentImages()
     }
   } catch (error) {
     console.error('更新顺序失败:', error)
@@ -274,7 +260,7 @@ const updateImageOrder = async (img) => {
   }
 }
 
-// 为某个学生单独添加图片（通过表格内的“添加图片”按钮）
+// 为某个学生单独添加图片
 const handleAddFile = async (file, studentId) => {
   const formData = new FormData()
   formData.append('files', file.raw)
@@ -297,20 +283,20 @@ const handleAddFile = async (file, studentId) => {
   }
 }
 
+// 获取学生列表（内部用）
 const fetchStudentList = async () => {
   try {
     const res = await axios.get(`/api/exams/${props.examId}/students`)
     if (res.data.code === 1) {
-      studentList.value = res.data.data
+      // 仅用于学生列表备胎，一般不直接使用
     }
   } catch (error) {
     console.error('获取学生列表失败', error)
   }
 }
 
-// 处理文件夹导入
+// 处理文件夹导入（使用 imagesPerStudent）
 const handleImportFolder = async () => {
-  // 优先使用 props.students，如果为空则使用内部获取的 studentList
   const students = (props.students && props.students.length) ? props.students : studentList.value
   if (!students || students.length === 0) {
     ElMessage.error('请先导入学生名单')
@@ -331,8 +317,8 @@ const handleImportFolder = async () => {
       return
     }
 
-    const totalStudents = students.length   // 修正：使用 students
-    const imagesPerStudent = 4
+    const totalStudents = students.length
+    const imagesPerStudent = props.imagesPerStudent   // 使用动态设置
     const requiredImages = totalStudents * imagesPerStudent
 
     if (imageFiles.length < requiredImages) {
@@ -342,18 +328,17 @@ const handleImportFolder = async () => {
 
     const groups = []
     for (let i = 0; i < totalStudents; i++) {
-      const student = students[i]           // 修正：使用 students
+      const student = students[i]
       const startIdx = i * imagesPerStudent
       const studentImages = imageFiles.slice(startIdx, startIdx + imagesPerStudent)
       groups.push({ studentId: student.student_id, files: studentImages })
     }
 
-    // 确认上传
     try {
       await ElMessageBox.confirm(
-          `将为 ${totalStudents} 个学生各上传 ${imagesPerStudent} 张图片，共 ${requiredImages} 张。是否继续？`,
-          '确认导入',
-          { type: 'info' }
+        `将为 ${totalStudents} 个学生各上传 ${imagesPerStudent} 张图片，共 ${requiredImages} 张。是否继续？`,
+        '确认导入',
+        { type: 'info' }
       )
     } catch {
       return
@@ -372,9 +357,9 @@ const handleImportFolder = async () => {
 
       try {
         const res = await axios.post(
-            `/api/exams/${props.examId}/images`,
-            formData,
-            { headers: { 'Content-Type': 'multipart/form-data' } }
+          `http://localhost:8001/api/exams/${props.examId}/images`,
+          formData,
+          { headers: { 'Content-Type': 'multipart/form-data' } }
         )
         if (res.data.code === 1) {
           successCount += group.files.length
@@ -390,97 +375,11 @@ const handleImportFolder = async () => {
 
     folderUploading.value = false
     ElMessage.success(`上传完成：成功 ${successCount} 张，失败 ${failCount} 张`)
-    // 刷新图片列表
     await fetchStudentImages()
   }
 
   input.click()
 }
-
-//拖拽操作
-const handleDragStart = (event, img, sourceStudentId) => {
-  draggingImage.value = img
-  draggingSourceStudentId.value = sourceStudentId
-  event.dataTransfer.effectAllowed = 'move'
-  event.dataTransfer.setData('text/plain', JSON.stringify({
-    id: img.id,
-    sourceStudentId: sourceStudentId,
-    filename: img.filename
-  }))
-}
-
-const handleDragEnd = () => {
-  // 不做任何清空，由 drop 事件负责清理
-}
-
-const handleDrop = async (event, targetStudentId) => {
-  event.preventDefault()
-
-  let image = draggingImage.value
-  let sourceId = draggingSourceStudentId.value
-
-  // 如果全局变量丢失，尝试从 dataTransfer 恢复
-  if (!image) {
-    const rawData = event.dataTransfer.getData('text/plain')
-    if (rawData) {
-      try {
-        const { id, sourceStudentId, filename } = JSON.parse(rawData)
-        image = { id, filename }
-        sourceId = sourceStudentId
-        // 重新赋值给全局变量，以便后续使用
-        draggingImage.value = image
-        draggingSourceStudentId.value = sourceId
-      } catch (e) {
-        console.error('恢复拖拽数据失败', e)
-        return
-      }
-    } else {
-      return
-    }
-  }
-
-  if (!image || sourceId === targetStudentId) {
-    // 清空状态并返回
-    draggingImage.value = null
-    draggingSourceStudentId.value = null
-    return
-  }
-
-  // 确认移动
-  try {
-    await ElMessageBox.confirm(
-        `将图片 "${image.filename}" 移动到 ${studentList.value.find(s => s.student_id === targetStudentId)?.name} 名下？`,
-        '确认移动',
-        { type: 'info' }
-    )
-  } catch {
-    draggingImage.value = null
-    draggingSourceStudentId.value = null
-    return
-  }
-
-  // 调用后端接口
-  try {
-    const res = await axios.put(
-        `http://localhost:8001/api/exams/${props.examId}/images/${image.id}/transfer`,
-        null,
-        { params: { target_student_id: targetStudentId } }
-    )
-    if (res.data.code === 1) {
-      ElMessage.success('图片已移动')
-      await fetchStudentImages()
-    } else {
-      ElMessage.error(res.data.msg || '移动失败')
-    }
-  } catch (error) {
-    console.error('移动图片失败:', error)
-    ElMessage.error('移动图片失败')
-  } finally {
-    draggingImage.value = null
-    draggingSourceStudentId.value = null
-  }
-}
-
 
 onMounted(() => {
   fetchStudentImages()
@@ -503,13 +402,9 @@ onMounted(() => {
 .image-item {
   width: 160px;
   border: 1px solid #e4e7ed;
-  border-radius: 4px;
+  border-radius: 8px;
   padding: 8px;
   background: #fafafa;
-  cursor: grab;
-}
-.image-item:active {
-  cursor: grabbing;
 }
 .image-thumb {
   width: 100%;
